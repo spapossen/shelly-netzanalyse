@@ -73,18 +73,26 @@ paket_bauen() {
   tar czf "$ARBEIT/shelly-monitor.tar.gz" -C "$ARBEIT" shelly-monitor
 }
 
+# Befehl im Container ausführen. Die Locale des Hosts (z. B. en_US.UTF-8) ist im Container nicht
+# erzeugt, daher C.UTF-8 setzen, sonst warnen apt und perl bei jedem Aufruf.
+im_ct() {
+  local ctid="$1"
+  shift
+  pct exec "$ctid" -- env LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE= "$@"
+}
+
 dateien_installieren() {
   local ctid="$1"
   shift
   pct push "$ctid" "$ARBEIT/shelly-monitor.tar.gz" /root/shelly-monitor.tar.gz
-  pct exec "$ctid" -- bash -c 'rm -rf /root/shelly-monitor && tar xzf /root/shelly-monitor.tar.gz -C /root && rm /root/shelly-monitor.tar.gz'
-  pct exec "$ctid" -- bash /root/shelly-monitor/install.sh "$@"
+  im_ct "$ctid" bash -c 'rm -rf /root/shelly-monitor && tar xzf /root/shelly-monitor.tar.gz -C /root && rm /root/shelly-monitor.tar.gz'
+  im_ct "$ctid" OHNE_ADRESSE=1 bash /root/shelly-monitor/install.sh "$@"
 }
 
 adresse_anzeigen() {
   local ctid="$1" ip port
-  ip="$(pct exec "$ctid" -- hostname -I 2>/dev/null | awk '{print $1}')"
-  port="$(pct exec "$ctid" -- sed -n 's/^port *= *//p' /etc/shelly-monitor/config.ini 2>/dev/null | head -1)"
+  ip="$(im_ct "$ctid" hostname -I 2>/dev/null | awk '{print $1}')"
+  port="$(im_ct "$ctid" sed -n 's/^port *= *//p' /etc/shelly-monitor/config.ini 2>/dev/null | head -1)"
   echo
   info "Fertig. Container $ctid, Bericht: http://${ip:-<container-ip>}:${port:-8080}/"
   echo "    Einstellungen: pct exec $ctid -- nano /etc/shelly-monitor/config.ini"
@@ -152,14 +160,18 @@ pct start "$CTID"
 
 info "Warte auf Netzwerk im Container"
 for _ in $(seq 1 60); do
-  if pct exec "$CTID" -- getent hosts deb.debian.org >/dev/null 2>&1; then
+  if im_ct "$CTID" getent hosts deb.debian.org >/dev/null 2>&1; then
     break
   fi
   sleep 2
 done
-pct exec "$CTID" -- getent hosts deb.debian.org >/dev/null 2>&1 || fehler "Container $CTID hat kein Netzwerk/DNS."
+if ! im_ct "$CTID" getent hosts deb.debian.org >/dev/null 2>&1; then
+  fehler "Container $CTID hat kein Netzwerk/DNS."
+fi
+# Dauerhafte Locale im Container, damit auch spätere Anmeldungen ohne Warnungen laufen
+im_ct "$CTID" bash -c 'echo "LANG=C.UTF-8" > /etc/default/locale'
 
 info "Aktualisiere Container und installiere den Dienst"
-pct exec "$CTID" -- bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y -qq dist-upgrade >/dev/null'
+im_ct "$CTID" bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y -qq dist-upgrade >/dev/null'
 dateien_installieren "$CTID" "$SHELLY_IP" "$SICHERUNG"
 adresse_anzeigen "$CTID"

@@ -43,6 +43,9 @@ systemctl restart shelly-monitor
 sleep 2
 systemctl --no-pager --lines=5 status shelly-monitor || true
 
-PORT="$(sed -n 's/^port *= *//p' "$KONFIG" | head -1)"
-echo
-echo "Bericht: http://$(hostname -I | awk '{print $1}'):${PORT:-8080}/"
+# Beim Aufruf aus proxmox-lxc.sh zeigt das Host-Skript die Adresse selbst an
+if [ -z "${OHNE_ADRESSE:-}" ]; then
+  PORT="$(sed -n 's/^port *= *//p' "$KONFIG" | head -1)"
+  echo
+  echo "Bericht: http://$(hostname -I | awk '{print $1}'):${PORT:-8080}/"
+fi
