@@ -1,0 +1,19 @@
+[Unit]
+Description=Shelly Pro 3EM Monitor (Lastreserve und Netzqualität)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=shelly
+Group=shelly
+ExecStart=/usr/bin/python3 /opt/shelly-monitor/shelly_monitor.py --config /etc/shelly-monitor/config.ini
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/shelly-monitor
+
+[Install]
+WantedBy=multi-user.target
