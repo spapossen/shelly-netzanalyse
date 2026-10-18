@@ -55,7 +55,11 @@ trap 'rm -rf "$ARBEIT"' EXIT
 # Programmdateien: aus dem Verzeichnis dieses Skripts, falls es aus einem Klon läuft, sonst von GitHub
 paket_bauen() {
   local hier
-  hier="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+  hier=""
+  if cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null; then
+    hier="$(pwd)"
+    cd - >/dev/null
+  fi
   mkdir -p "$ARBEIT/shelly-monitor"
   if [ -n "$hier" ] && [ -f "$hier/shelly_monitor.py" ] && [ -f "$hier/install.sh" ]; then
     info "Verwende die Dateien aus $hier"
@@ -119,7 +123,9 @@ frage NETZ "IP des Containers: dhcp oder z. B. 192.168.1.60/24" "dhcp"
 if [ "$NETZ" != "dhcp" ]; then
   frage GATEWAY "Gateway" ""
 fi
-[ -n "$STORAGE" ] && [ -n "$TEMPLATE_STORAGE" ] || fehler "Kein passender Speicher gefunden."
+if [ -z "$STORAGE" ] || [ -z "$TEMPLATE_STORAGE" ]; then
+  fehler "Kein passender Speicher gefunden."
+fi
 
 info "Suche aktuelle Debian-$DEBIAN_VERSION-Vorlage"
 pveam update >/dev/null || rot "pveam update fehlgeschlagen, nutze vorhandene Liste"
