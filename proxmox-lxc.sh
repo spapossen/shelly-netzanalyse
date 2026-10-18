@@ -116,7 +116,7 @@ echo
 
 frage SHELLY_IP "IP-Adresse des Shelly Pro 3EM"
 [ -n "$SHELLY_IP" ] || fehler "Ohne Shelly-IP geht es nicht."
-frage SICHERUNG "Nennstrom der Hausanschlusssicherung in A" "63"
+frage SICHERUNG "Nennstrom der Vorsicherung des Messpunkts in A" "63"
 frage CTID "Container-ID" "$(pvesh get /cluster/nextid)"
 pct status "$CTID" >/dev/null 2>&1 && fehler "Container $CTID existiert bereits (zum Aktualisieren: --update $CTID)."
 frage CT_NAME "Hostname" "shelly-monitor"

@@ -96,6 +96,7 @@ class MonitorTest(Basis):
             zeilen.append(zeile)
         sm.einfuegen(con, "minute", zeilen)
         r = sm.bericht(con, ts, ts + 180, self.k)
+        con.close()
         arten = {(e["art"], tuple(e["phasen"])): e["extrem"] for e in r["ereignisse"]}
         self.assertEqual(arten, {("Überspannung", ("L1",)): 261, ("Unterspannung", ("L3",)): 185})
 
@@ -114,6 +115,81 @@ class MonitorTest(Basis):
         seite = sm.bericht_html(r, sm.verlauf(self.con, 1000, 2000, self.k), self.k,
                                 {"von": "", "bis": ""}, False)
         self.assertIn("noch keine Daten", seite)
+
+
+class NeutralleiterTest(unittest.TestCase):
+    """Synthetische Anlage mit bekannten Leiterwiderständen: Z_L = 0,25 Ω, Z_N = 0,6 Ω."""
+
+    Z_L, Z_N = 0.25, 0.6
+
+    @classmethod
+    def setUpClass(cls):
+        import cmath
+        import random
+        zufall = random.Random(7)
+        cls.k = sm.Konfig(None)
+        cls.k.zuleitung_m, cls.k.zuleitung_mm2, cls.k.zuleitung_n_mm2 = 250, 25, 25
+        cls.con = sm.verbinden(":memory:")
+        cls.start = 1_700_000_040
+        stroeme = [10.0, 10.0, 10.0]
+        zeilen = []
+        for m in range(3000):
+            stroeme = [min(40, max(0, i + zufall.gauss(0, 3))) for i in stroeme]
+            zeiger = {p: cmath.rect(1, sm.WINKEL[p]) for p, _ in sm.PHASEN}
+            i_n = sum(i * zeiger[p] for i, (p, _) in zip(stroeme, sm.PHASEN))
+            zeile = {"ts": cls.start + 60 * m}
+            for i, (p, _) in zip(stroeme, sm.PHASEN):
+                u = abs(230 * zeiger[p] - cls.Z_L * i * zeiger[p] - cls.Z_N * i_n)
+                zeile.update({f"{p}_avg_voltage": u, f"{p}_min_voltage": u - 0.5, f"{p}_max_voltage": u + 0.5,
+                              f"{p}_avg_current": i, f"{p}_max_current": i + 1, f"{p}_max_aprt_power": u * i,
+                              f"{p}_total_act_energy": u * i / 60, f"{p}_total_act_ret_energy": 0,
+                              f"{p}_lag_react_energy": 0, f"{p}_lead_react_energy": 0})
+            sm.abgeleitet_minute(zeile)
+            zeilen.append(zeile)
+        sm.einfuegen(cls.con, "minute", zeilen)
+        cls.r = sm.bericht(cls.con, cls.start, cls.start + 60 * 3000, cls.k)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.con.close()
+
+    def test_sternpunkt_und_n_strom(self):
+        self.assertAlmostEqual(sm.sternpunkt(230, 230, 230), 0, places=6)
+        self.assertAlmostEqual(sm.n_strom({"a": 10, "b": 10, "c": 10}, {}), 0, places=6)
+        self.assertAlmostEqual(sm.n_strom({"a": 10, "b": 0, "c": 0}, {}), 10, places=6)
+        self.assertIsNone(sm.sternpunkt(230, None, 230))
+
+    def test_kopplungsmatrix_trennt_z_l_und_z_n(self):
+        ko = self.r["kopplung"]
+        self.assertAlmostEqual(ko["z_n"], self.Z_N, delta=0.06)
+        for z_l in ko["z_l"]:
+            self.assertAlmostEqual(z_l, self.Z_L, delta=0.06)
+
+    def test_steigung_entspricht_z_n_plus_zwei_drittel_z_l(self):
+        fit = self.r["neutral"]["fit"]
+        self.assertAlmostEqual(fit["z"], self.Z_N + 2 / 3 * self.Z_L, delta=0.08)
+        self.assertGreater(fit["r2"], 0.9)
+
+    def test_bewertung_gegen_zuleitung(self):
+        stufe, was, text = sm.neutral_bewertung(self.r)
+        self.assertEqual(was, "Neutralleiter")
+        self.assertEqual(stufe, "krit")  # 0,6 Ω gegenüber ≈ 0,21 Ω aus 250 m 25 mm² Cu
+        self.assertIn("Faktor", text)
+
+    def test_nachberechnung(self):
+        self.con.execute("UPDATE minute SET calc_version = NULL, calc_sternpunkt = NULL")
+        self.assertEqual(sm.nachberechnen(self.con), 3000)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM minute WHERE calc_sternpunkt IS NULL").fetchone()[0], 0)
+
+    def test_fachdaten(self):
+        fd = sm.fachdaten(self.con, self.start, self.start + 60 * 3000, self.k, "minute")
+        self.assertEqual(len(fd["tagesprofil"]), 24)
+        self.assertEqual(len(fd["tiefste"]), 15)
+        self.assertTrue(any(p["groesse"] == "Sternpunktverschiebung" for p in fd["perzentile"]))
+        seite = sm.fachbericht_html(self.r, fd, sm.verlauf(self.con, self.start, self.start + 180000, self.k),
+                                    self.k, {"von": "", "bis": ""}, True)
+        self.assertIn("Kopplung Spannung–Strom", seite)
+        self.assertNotIn("Bewertung", seite)
 
 
 class WebTest(Basis):
@@ -142,6 +218,9 @@ class WebTest(Basis):
         self.assertIn('"live":false', seite)
         _, _, text = self.holen(basis + "/api/bericht?von=2020-01-01T00:00&bis=2030-01-01T00:00")
         self.assertIn("phasen", json.loads(text))
+        _, kopf, seite = self.holen(basis + "/?zeitraum=24h&modus=fach&download=1")
+        self.assertIn("fachbericht_", kopf["Content-Disposition"])
+        self.assertIn("Methoden und Annahmen", seite)
         _, kopf, text = self.holen(basis + "/export.csv?tabelle=sekunde&zeitraum=1h")
         self.assertTrue(text.startswith("zeit;ts;"))
         self.assertEqual(len(text.strip().splitlines()), 601)

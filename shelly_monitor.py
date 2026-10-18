@@ -83,6 +83,11 @@ class Konfig:
         self.nennspannung = float(g("anlage", "nennspannung", "230"))
         self.min_stufe = float(g("anlage", "min_laststufe_a", "8"))
         self.name = g("anlage", "name", "Messpunkt")
+        self.messpunkt = g("anlage", "messpunkt", "")
+        self.zuleitung_m = float(g("zuleitung", "laenge_m", "0") or 0)
+        self.zuleitung_mm2 = float(g("zuleitung", "querschnitt_mm2", "0") or 0)
+        self.zuleitung_n_mm2 = float(g("zuleitung", "querschnitt_n_mm2", "0") or 0) or self.zuleitung_mm2
+        self.zuleitung_material = g("zuleitung", "material", "cu").lower()
         self.zeitzone = ZoneInfo(g("anlage", "zeitzone", "Europe/Berlin"))
 
 
@@ -137,6 +142,10 @@ class Shelly:
     def status(self):
         return self._get("/rpc/EM.GetStatus", 3, id=0).json()
 
+    def geraet(self):
+        d = self._get("/rpc/Shelly.GetDeviceInfo", 5).json()
+        return {n: d.get(n) for n in ("model", "name", "mac", "fw_id", "ver", "app")}
+
     def erster_datensatz(self):
         bloecke = self._get("/rpc/EMData.GetRecords", 10, id=0).json().get("data_blocks") or []
         return min((b["ts"] for b in bloecke), default=None)
@@ -164,6 +173,11 @@ def erfassung(k, stop):
     con = verbinden(k.datenbank)
     shelly = Shelly(k)
     puffer, stufen, vorher, letzter_log = [], [], None, 0.0
+    vorzeichen, vorzeichen_zeit = {}, 0.0
+    try:
+        status_setzen(geraet=shelly.geraet())
+    except Exception as e:
+        LOG.warning("Geräteinfo nicht lesbar: %s", e)
     naechster = math.ceil(time.time() / k.intervall) * k.intervall
     while not stop.is_set():
         warte = naechster - time.time()
@@ -178,6 +192,9 @@ def erfassung(k, stop):
             zeile = {"ts": ts}
             zeile.update({n: float(v) for n, v in d.items()
                           if n != "id" and isinstance(v, (int, float)) and not isinstance(v, bool)})
+            if time.time() - vorzeichen_zeit > 300:
+                vorzeichen, vorzeichen_zeit = blind_vorzeichen(con), time.time()
+            abgeleitet_sekunde(zeile, vorzeichen)
             puffer.append(zeile)
             if vorher and ts - vorher["ts"] <= 2.5 * k.intervall:
                 stufen += laststufen(vorher, zeile)
@@ -232,6 +249,8 @@ def minuten_abgleichen(con, shelly):
     while start < jetzt:
         ende = min(start + 86400, jetzt)
         zeilen = shelly.minutenwerte(start, ende)
+        for zeile in zeilen:
+            abgeleitet_minute(zeile)
         einfuegen(con, "minute", zeilen)
         con.commit()
         gesamt += len(zeilen)
@@ -243,10 +262,15 @@ def abgleich(k, stop):
     """Holt die Minutenhistorie aus dem Shelly und räumt alte Sekundenwerte auf."""
     con = verbinden(k.datenbank)
     shelly = Shelly(k)
-    letzte_reinigung = 0.0
+    letzte_reinigung, nachberechnet = 0.0, False
     while not stop.is_set():
         try:
             n = minuten_abgleichen(con, shelly)
+            if not nachberechnet:
+                m = nachberechnen(con)
+                nachberechnet = True
+                if m:
+                    LOG.info("%d Datensätze nachberechnet (N-Strom, Sternpunktverschiebung)", m)
             with STATUS_LOCK:
                 STATUS["letzter_abgleich"] = int(time.time())
                 STATUS["abgleich_zeilen"] += n
@@ -265,6 +289,174 @@ def abgleich(k, stop):
             if geloescht:
                 LOG.info("%d alte Sekundenwerte gelöscht", geloescht)
         stop.wait(k.abgleich_minuten * 60)
+
+
+# --------------------------------------------------------------------------- Neutralleiter und Sternpunkt
+
+# Lage der Spannungszeiger L1, L2, L3 (Rechtsdrehfeld)
+WINKEL = {"a": 0.0, "b": -2 * math.pi / 3, "c": 2 * math.pi / 3}
+BERECHNUNG_VERSION = 1
+
+
+def sternpunkt(ua, ub, uc):
+    """Verschiebung des Sternpunkts in V aus den drei Spannungen L–N.
+
+    Die Spannungen sind die Abstände des Sternpunkts zu den Ecken des Außenleiter-Dreiecks. Unter der
+    Annahme gleich großer Außenleiterspannungen (Seite s) gilt 3(a⁴+b⁴+c⁴+s⁴) = (a²+b²+c²+s²)², und der
+    Abstand zum Mittelpunkt ist √((a²+b²+c² − s²)/3)."""
+    if None in (ua, ub, uc) or min(ua, ub, uc) < 50:
+        return None
+    s2, s4 = ua * ua + ub * ub + uc * uc, ua ** 4 + ub ** 4 + uc ** 4
+    d = s2 * s2 - 2 * (3 * s4 - s2 * s2)
+    if d < 0:
+        return None
+    seite2 = (s2 + math.sqrt(d)) / 2
+    return math.sqrt(max(0.0, (s2 - seite2) / 3))
+
+
+def n_strom(stroeme, winkel):
+    """Neutralleiterstrom (Grundschwingung) als Zeigersumme der Außenleiterströme.
+
+    winkel: Phasenverschiebung φ je Phase in rad, positiv = induktiv (Strom eilt nach)."""
+    re = im = 0.0
+    for p, _ in PHASEN:
+        i = stroeme.get(p)
+        if i is None:
+            return None
+        w = WINKEL[p] - winkel.get(p, 0.0)
+        re += i * math.cos(w)
+        im += i * math.sin(w)
+    return math.hypot(re, im)
+
+
+def abgeleitet_minute(zeile):
+    """Ergänzt eine Minutenzeile um berechneten N-Strom und Sternpunktverschiebung."""
+    winkel = {}
+    for p, _ in PHASEN:
+        wirk = (zeile.get(f"{p}_total_act_energy") or 0) - (zeile.get(f"{p}_total_act_ret_energy") or 0)
+        blind = (zeile.get(f"{p}_lag_react_energy") or 0) - (zeile.get(f"{p}_lead_react_energy") or 0)
+        winkel[p] = math.atan2(blind, wirk) if (wirk or blind) else 0.0
+    zeile["calc_n_current"] = n_strom({p: zeile.get(f"{p}_avg_current") for p, _ in PHASEN}, winkel)
+    zeile["calc_sternpunkt"] = sternpunkt(*(zeile.get(f"{p}_avg_voltage") for p, _ in PHASEN))
+    zeile["calc_version"] = BERECHNUNG_VERSION
+
+
+def abgeleitet_sekunde(zeile, vorzeichen):
+    """Wie abgeleitet_minute; die Richtung der Blindleistung (induktiv/kapazitiv) stammt aus den Minutenwerten,
+    weil die Momentanwerte nur ihren Betrag liefern."""
+    winkel = {}
+    for p, _ in PHASEN:
+        wirk, schein = zeile.get(f"{p}_act_power"), zeile.get(f"{p}_aprt_power")
+        if wirk is None or schein is None:
+            winkel[p] = 0.0
+            continue
+        blind = math.sqrt(max(0.0, schein * schein - wirk * wirk)) * vorzeichen.get(p, 1.0)
+        winkel[p] = math.atan2(blind, wirk) if (wirk or blind) else 0.0
+    zeile["calc_n_current"] = n_strom({p: zeile.get(f"{p}_current") for p, _ in PHASEN}, winkel)
+    zeile["calc_sternpunkt"] = sternpunkt(*(zeile.get(f"{p}_voltage") for p, _ in PHASEN))
+    zeile["calc_version"] = BERECHNUNG_VERSION
+
+
+def _blind_ausdruck(con):
+    sp = set(spalten(con, "minute"))
+    if not all(f"{p}_lag_react_energy" in sp and f"{p}_lead_react_energy" in sp for p, _ in PHASEN):
+        return None
+    return ", ".join(f'"{p}_lag_react_energy" - "{p}_lead_react_energy"' for p, _ in PHASEN)
+
+
+def blind_vorzeichen(con):
+    """Richtung der Blindleistung je Phase aus dem jüngsten Minutenwert (+1 induktiv, −1 kapazitiv)."""
+    ausdruck = _blind_ausdruck(con)
+    if not ausdruck:
+        return {}
+    zeile = con.execute(f"SELECT {ausdruck} FROM minute ORDER BY ts DESC LIMIT 1").fetchone()
+    return {p: -1.0 if (q or 0) < 0 else 1.0 for (p, _), q in zip(PHASEN, zeile)} if zeile else {}
+
+
+def nachberechnen(con, stapel=20000):
+    """Ergänzt N-Strom und Sternpunktverschiebung für vorhandene Daten (einmalig nach einem Update)."""
+    gesamt = 0
+    for tabelle in ("minute", "sekunde"):
+        vorhanden = set(spalten(con, tabelle))
+        for n in ("calc_version", "calc_n_current", "calc_sternpunkt"):
+            if n not in vorhanden:
+                con.execute(f'ALTER TABLE {tabelle} ADD COLUMN "{n}" REAL')
+        namen = spalten(con, tabelle)
+        ausdruck = _blind_ausdruck(con)
+        while True:
+            zeilen = [dict(zip(namen, z)) for z in con.execute(
+                f"SELECT * FROM {tabelle} WHERE calc_version IS NULL ORDER BY ts LIMIT ?", (stapel,))]
+            if not zeilen:
+                break
+            if tabelle == "minute":
+                for zeile in zeilen:
+                    abgeleitet_minute(zeile)
+            else:
+                vz = {}
+                if ausdruck:
+                    for ts, *q in con.execute(f"SELECT ts, {ausdruck} FROM minute WHERE ts >= ? AND ts <= ?",
+                                              (zeilen[0]["ts"] - 60, zeilen[-1]["ts"])):
+                        vz[ts // 60 * 60] = {p: -1.0 if (w or 0) < 0 else 1.0 for (p, _), w in zip(PHASEN, q)}
+                for zeile in zeilen:
+                    abgeleitet_sekunde(zeile, vz.get(zeile["ts"] // 60 * 60, {}))
+            con.executemany(f"UPDATE {tabelle} SET calc_n_current = ?, calc_sternpunkt = ?, calc_version = ? "
+                            "WHERE ts = ?", [(z["calc_n_current"], z["calc_sternpunkt"], BERECHNUNG_VERSION, z["ts"])
+                                             for z in zeilen])
+            con.commit()
+            gesamt += len(zeilen)
+    return gesamt
+
+
+def regression(x, y):
+    """Lineare Regression y = a + b·x; liefert (a, b, R², n) oder None."""
+    n = len(x)
+    if n < 30:
+        return None
+    mx, my = sum(x) / n, sum(y) / n
+    sxx = sum((v - mx) ** 2 for v in x)
+    syy = sum((v - my) ** 2 for v in y)
+    sxy = sum((a - mx) * (b - my) for a, b in zip(x, y))
+    if sxx <= 0 or syy <= 0:
+        return None
+    b = sxy / sxx
+    return my - b * mx, b, sxy * sxy / (sxx * syy), n
+
+
+def perzentil(sortiert, q):
+    if not sortiert:
+        return None
+    return sortiert[min(len(sortiert) - 1, max(0, int(round(q * (len(sortiert) - 1)))))]
+
+
+def neutral_auswertung(con, von, bis, tabelle, punkte=1500):
+    """Berechneter N-Strom und Sternpunktverschiebung, ihre Statistik und die Ausgleichsgerade
+    Verschiebung = U0 + Z(N)·I(N)."""
+    if "calc_sternpunkt" not in set(spalten(con, tabelle)):
+        return None
+    zeilen = con.execute(f"SELECT ts, calc_n_current, calc_sternpunkt FROM {tabelle} WHERE ts >= ? AND ts < ? "
+                         "AND calc_n_current IS NOT NULL AND calc_sternpunkt IS NOT NULL ORDER BY ts",
+                         (von, bis)).fetchall()
+    if not zeilen:
+        return None
+    x = [z[1] for z in zeilen]
+    y = [z[2] for z in zeilen]
+    xs, ys = sorted(x), sorted(y)
+    r = {"n": len(zeilen), "quelle": tabelle,
+         "i_max": xs[-1], "i_99": perzentil(xs, 0.99), "i_avg": sum(x) / len(x),
+         "u_max": ys[-1], "u_95": perzentil(ys, 0.95), "u_avg": sum(y) / len(y), "fit": None}
+    fit = regression(x, y)
+    if fit and (xs[-1] - xs[0]) >= 3:
+        r["fit"] = {"u0": fit[0], "z": fit[1], "r2": fit[2], "n": fit[3]}
+    klassen = {}
+    for a, b in zip(x, y):
+        klassen.setdefault(int(a // 2), []).append(b)
+    r["klassen"] = [{"von": 2 * kl, "bis": 2 * kl + 2, "n": len(w), "median": perzentil(sorted(w), 0.5),
+                     "p95": perzentil(sorted(w), 0.95)} for kl, w in sorted(klassen.items())]
+    schritt = max(1, math.ceil(len(zeilen) / punkte))
+    auswahl = zeilen[::schritt]
+    r["punkte"] = {"t": [z[0] for z in auswahl], "x": [round(z[1], 2) for z in auswahl],
+                   "y": [round(z[2], 2) for z in auswahl]}
+    return r
 
 
 # --------------------------------------------------------------------------- Auswertung
@@ -440,7 +632,160 @@ def bericht(con, von, bis, k):
     r["ereignisse"].sort(key=lambda e: e["start"], reverse=True)
     for e in r["ereignisse"]:
         e["phasen"] = sorted(e["phasen"])
+    r["neutral"] = neutral_auswertung(con, von, bis, tabelle)
+    r["kopplung"] = kopplung(con, von, bis, tabelle, schritt)
+    r["zuleitung"] = zuleitung(k)
     return r
+
+
+def kleinste_quadrate(x, y):
+    """Mehrfache lineare Regression y = c0 + Σ cj·xj (Normalgleichungen, Gauß mit Pivotsuche).
+    Liefert (Koeffizienten, R²) oder None."""
+    m = len(x[0]) + 1
+    a = [[0.0] * m for _ in range(m)]
+    b = [0.0] * m
+    for zeile, w in zip(x, y):
+        v = [1.0] + list(zeile)
+        for i in range(m):
+            b[i] += v[i] * w
+            for j in range(m):
+                a[i][j] += v[i] * v[j]
+    for i in range(m):
+        piv = max(range(i, m), key=lambda r: abs(a[r][i]))
+        if abs(a[piv][i]) < 1e-12:
+            return None
+        a[i], a[piv], b[i], b[piv] = a[piv], a[i], b[piv], b[i]
+        for r in range(i + 1, m):
+            f = a[r][i] / a[i][i]
+            for j in range(i, m):
+                a[r][j] -= f * a[i][j]
+            b[r] -= f * b[i]
+    koeff = [0.0] * m
+    for i in range(m - 1, -1, -1):
+        koeff[i] = (b[i] - sum(a[i][j] * koeff[j] for j in range(i + 1, m))) / a[i][i]
+    my = sum(y) / len(y)
+    ss_tot = sum((w - my) ** 2 for w in y)
+    ss_res = sum((w - koeff[0] - sum(c * v for c, v in zip(koeff[1:], zeile))) ** 2 for zeile, w in zip(x, y))
+    return koeff, (1 - ss_res / ss_tot) if ss_tot > 0 else None
+
+
+def kopplung(con, von, bis, tabelle, raster):
+    """Kopplungsmatrix M[k][j] = ΔU(k)/ΔI(j) in Ω aus Änderungen zwischen aufeinanderfolgenden Messwerten.
+
+    Modell (ohmsch, linearisiert): ΔU(k) = −(Z_L + Z_N)·ΔI(k) + ½·Z_N·Σ ΔI(j≠k). Daraus
+    Z_N ≈ 2 × Mittel der Nebendiagonale und Z_L(k) ≈ −M[k][k] − Z_N."""
+    f = felder(con, tabelle)
+    sp = [f[p]["uavg"] for p, _ in PHASEN] + [f[p]["iavg"] for p, _ in PHASEN]
+    zeilen = con.execute(f"SELECT ts, {', '.join(sp)} FROM {tabelle} WHERE ts >= ? AND ts < ? ORDER BY ts",
+                         (von, bis)).fetchall()
+    x, y = [], [[], [], []]
+    for alt, neu in zip(zeilen, zeilen[1:]):
+        if neu[0] - alt[0] != raster or None in alt or None in neu:
+            continue
+        x.append([neu[4 + j] - alt[4 + j] for j in range(3)])
+        for k in range(3):
+            y[k].append(neu[1 + k] - alt[1 + k])
+    if len(x) < 100:
+        return None
+    streuung = [math.sqrt(sum(v[j] ** 2 for v in x) / len(x)) for j in range(3)]
+    matrix, r2 = [], []
+    for k in range(3):
+        ergebnis = kleinste_quadrate(x, y[k])
+        if not ergebnis:
+            return None
+        matrix.append(ergebnis[0][1:])
+        r2.append(ergebnis[1])
+    neben = [matrix[k][j] for k in range(3) for j in range(3) if j != k]
+    z_n = 2 * sum(neben) / len(neben)
+    return {"matrix": matrix, "r2": r2, "n": len(x), "streuung_di": streuung, "raster": raster,
+            "z_n": z_n, "z_l": [-matrix[k][k] - z_n for k in range(3)]}
+
+
+def zuleitung(k):
+    """Erwartete Widerstände der Zuleitung zum Messpunkt aus Länge, Querschnitt und Material."""
+    if not (k.zuleitung_m and k.zuleitung_mm2):
+        return None
+    rho, alpha = {"al": (0.0287, 0.00403)}.get(k.zuleitung_material, (0.0178, 0.00393))
+    warm = 1 + alpha * 50
+    r_l = rho * k.zuleitung_m / k.zuleitung_mm2
+    r_n = rho * k.zuleitung_m / k.zuleitung_n_mm2
+    return {"laenge_m": k.zuleitung_m, "querschnitt_mm2": k.zuleitung_mm2, "querschnitt_n_mm2": k.zuleitung_n_mm2,
+            "material": "Al" if k.zuleitung_material == "al" else "Cu",
+            "r_l": [r_l, r_l * warm], "r_n": [r_n, r_n * warm], "schleife": [r_l + r_n, (r_l + r_n) * warm],
+            "x_l": 0.08 * k.zuleitung_m / 1000,
+            "steigung": [r_n + 2 / 3 * r_l, (r_n + 2 / 3 * r_l) * warm]}
+
+
+def fachdaten(con, von, bis, k, tabelle):
+    """Rohdaten-Auswertung für die Fachkraft: Perzentile, 10-min-Statistik, Extremminuten, Tagesprofil."""
+    f = felder(con, tabelle)
+    calc = "calc_sternpunkt" in set(spalten(con, tabelle))
+    groessen = ("umin", "uavg", "umax", "iavg", "imax", "smax")
+    sp = ["ts"] + [f[p][g] for p, _ in PHASEN for g in groessen]
+    sp += ["calc_n_current", "calc_sternpunkt"] if calc else ["NULL", "NULL"]
+    zeilen = con.execute(f"SELECT {', '.join(sp)} FROM {tabelle} WHERE ts >= ? AND ts < ? ORDER BY ts",
+                         (von, bis)).fetchall()
+    if not zeilen:
+        return None
+    idx = {(p, g): 1 + i * len(groessen) + j for i, (p, _) in enumerate(PHASEN) for j, g in enumerate(groessen)}
+    i_n, i_sp = len(sp) - 2, len(sp) - 1
+    qs = (0, 0.01, 0.05, 0.5, 0.95, 0.99, 1)
+    d = {"quelle": tabelle, "n": len(zeilen), "perzentile": [], "quantile": qs}
+    namen = {"umin": "U Minimum", "uavg": "U Mittel", "umax": "U Maximum", "iavg": "I Mittel", "imax": "I Maximum",
+             "smax": "S Maximum"}
+    for g in groessen:
+        for p, name in PHASEN:
+            werte = sorted(z[idx[p, g]] for z in zeilen if z[idx[p, g]] is not None)
+            if g == "smax":
+                werte = [w / 1000 for w in werte]
+            d["perzentile"].append({"groesse": namen[g], "phase": name, "einheit": {"u": "V", "i": "A", "s": "kVA"}[g[0]],
+                                    "werte": [perzentil(werte, q) for q in qs]})
+    for g, n in (("calc_n", i_n), ("calc_sp", i_sp)):
+        werte = sorted(z[n] for z in zeilen if z[n] is not None)
+        if werte:
+            d["perzentile"].append({"groesse": "N-Strom (berechnet)" if g == "calc_n" else "Sternpunktverschiebung",
+                                    "phase": "–", "einheit": "A" if g == "calc_n" else "V",
+                                    "werte": [perzentil(werte, q) for q in qs]})
+
+    # 10-Minuten-Mittel der Spannung wie EN 50160
+    gruppen = {}
+    for z_ in zeilen:
+        gruppen.setdefault(z_[0] // 600, []).append(z_)
+    d["zehn_min"] = []
+    for p, name in PHASEN:
+        werte = sorted(sum(v) / len(v) for v in ([z_[idx[p, "uavg"]] for z_ in g if z_[idx[p, "uavg"]] is not None]
+                                                 for g in gruppen.values()) if v)
+        if werte:
+            d["zehn_min"].append({"phase": name, "n": len(werte), "min": werte[0], "p5": perzentil(werte, 0.05),
+                                  "p95": perzentil(werte, 0.95), "max": werte[-1],
+                                  "band": 100 * sum(U_MIN <= w <= U_MAX for w in werte) / len(werte),
+                                  "unter_85": sum(w < 0.85 * k.nennspannung for w in werte)})
+
+    def zeile_aus(z_):
+        return {"ts": z_[0], "umin": [z_[idx[p, "umin"]] for p, _ in PHASEN],
+                "uavg": [z_[idx[p, "uavg"]] for p, _ in PHASEN], "umax": [z_[idx[p, "umax"]] for p, _ in PHASEN],
+                "iavg": [z_[idx[p, "iavg"]] for p, _ in PHASEN], "imax": [z_[idx[p, "imax"]] for p, _ in PHASEN],
+                "n": z_[i_n], "sp": z_[i_sp]}
+    gueltig = [z_ for z_ in zeilen if None not in [z_[idx[p, g]] for p, _ in PHASEN for g in ("umin", "umax")]]
+    d["tiefste"] = [zeile_aus(z_) for z_ in sorted(gueltig, key=lambda z_: min(z_[idx[p, "umin"]] for p, _ in PHASEN))[:15]]
+    d["hoechste"] = [zeile_aus(z_) for z_ in sorted(gueltig, key=lambda z_: -max(z_[idx[p, "umax"]] for p, _ in PHASEN))[:10]]
+
+    # Tagesprofil nach Ortszeit
+    stunden = {}
+    for z_ in zeilen:
+        stunden.setdefault(datetime.fromtimestamp(z_[0], k.zeitzone).hour, []).append(z_)
+    d["tagesprofil"] = []
+    for h in range(24):
+        g = stunden.get(h, [])
+        eintrag = {"stunde": h, "n": len(g)}
+        for p, name in PHASEN:
+            uavg = [z_[idx[p, "uavg"]] for z_ in g if z_[idx[p, "uavg"]] is not None]
+            umin = [z_[idx[p, "umin"]] for z_ in g if z_[idx[p, "umin"]] is not None]
+            iavg = [z_[idx[p, "iavg"]] for z_ in g if z_[idx[p, "iavg"]] is not None]
+            eintrag[name] = {"uavg": sum(uavg) / len(uavg) if uavg else None, "umin": min(umin, default=None),
+                             "iavg": sum(iavg) / len(iavg) if iavg else None}
+        d["tagesprofil"].append(eintrag)
+    return d
 
 
 def verlauf(con, von, bis, k, punkte=720):
@@ -465,6 +810,14 @@ def verlauf(con, von, bis, k, punkte=720):
         v["umin"][name] = [rund(z[2 + 4 * i]) for z in zeilen]
         v["umax"][name] = [rund(z[3 + 4 * i]) for z in zeilen]
         v["i"][name] = [rund(z[4 + 4 * i]) for z in zeilen]
+
+    v["n"], v["sp"] = [], []
+    if "calc_sternpunkt" in set(spalten(con, tabelle)):
+        werte = dict((z[0], z[1:]) for z in con.execute(
+            f"SELECT (ts / {schritt}) * {schritt}, MAX(calc_n_current), MAX(calc_sternpunkt) FROM {tabelle} "
+            "WHERE ts >= ? AND ts < ? GROUP BY 1", (von, bis)))
+        v["n"] = [rund(werte.get(t, (None, None))[0]) for t in v["t"]]
+        v["sp"] = [rund(werte.get(t, (None, None))[1]) for t in v["t"]]
 
     sek = set(spalten(con, "sekunde"))
     fq = [f'"{p}_freq"' for p, _ in PHASEN if f"{p}_freq" in sek]
@@ -510,8 +863,67 @@ def neutralleiter(r):
     n_max, schief = r.get("n_max"), r.get("schieflast_max") or 0
     # Der Pro 3EM hat keinen Wandler im Neutralleiter; ein Wert nahe 0 bei deutlicher Schieflast ist nicht gemessen.
     if n_max is None or (n_max < 1 and schief > 5):
-        return "vom Shelly nicht gemessen (kein Wandler im Neutralleiter)"
+        return "vom Shelly nicht gemessen (kein Wandler im Neutralleiter), siehe berechneten Wert unten"
     return f"max {z(n_max, 1, 'A')}, Ø {z(r.get('n_avg'), 1, 'A')}"
+
+
+def neutral_bewertung(r):
+    """Vergleicht die gemessene Neutralleiter-Impedanz mit dem, was die Zuleitung erwarten lässt."""
+    ko, ne, zu = r.get("kopplung"), r.get("neutral"), r.get("zuleitung")
+    gemessen, erwartet, art = None, None, ""
+    if ko and ko["z_n"] > 0:
+        gemessen, art = ko["z_n"], "Z(N) aus der Kopplungsmatrix"
+        erwartet = zu["r_n"][1] if zu else None
+    elif ne and ne.get("fit"):
+        gemessen, art = ne["fit"]["z"], "Steigung Sternpunktverschiebung/N-Strom (≈ Z_N + ⅔·Z_L)"
+        erwartet = zu["steigung"][1] if zu else None
+    if gemessen is None:
+        if ne and ne["u_max"] > 10:
+            return ("warn", "Neutralleiter", f"Sternpunkt verschiebt sich um bis zu {z(ne['u_max'])} V; für Z(N) "
+                                             "fehlen noch genug Laständerungen.")
+        return ("info", "Neutralleiter", "Für eine Abschätzung fehlen noch Daten mit unterschiedlicher Schieflast.")
+    if erwartet is None:
+        return ("info", "Neutralleiter", f"{art}: {z(gemessen, 2)} Ω. Zur Einordnung Länge und Querschnitt der "
+                                         "Zuleitung in der Konfiguration eintragen ([zuleitung]).")
+    faktor = gemessen / erwartet if erwartet else float("inf")
+    text = f"{art}: {z(gemessen, 2)} Ω, die Zuleitung erklärt bei 70 °C {z(erwartet, 2)} Ω (Faktor {z(faktor, 1)})."
+    if faktor <= 1.5:
+        return ("ok", "Neutralleiter", text + " Durch die Zuleitung erklärbar.")
+    if faktor <= 2.5:
+        return ("warn", "Neutralleiter", text + " Etwas mehr, als die Zuleitung erklärt.")
+    return ("krit", "Neutralleiter", text + " Deutlich mehr, als die Zuleitung erklärt: N-/PEN-Verbindungen prüfen.")
+
+
+def neutral_html(r, mit_streuung=True):
+    ne, ko, zu = r.get("neutral"), r.get("kopplung"), r.get("zuleitung")
+    if not ne:
+        return ""
+    e = html.escape
+    zeilen = [("N-Strom, berechnet (Grundschwingung)",
+               f"max {z(ne['i_max'], 1, 'A')}, 99 %-Wert {z(ne['i_99'], 1, 'A')}, Ø {z(ne['i_avg'], 1, 'A')}"),
+              ("Sternpunktverschiebung", f"max {z(ne['u_max'], 1, 'V')}, 95 %-Wert {z(ne['u_95'], 1, 'V')}, "
+                                         f"Ø {z(ne['u_avg'], 1, 'V')}")]
+    if ne.get("fit"):
+        fit = ne["fit"]
+        zeilen.append(("Ausgleichsgerade Verschiebung = U₀ + k·I(N)",
+                       f"k = {z(fit['z'], 3, 'Ω')} (≈ Z_N + ⅔·Z_L), U₀ = {z(fit['u0'], 1, 'V')}, "
+                       f"R² = {z(fit['r2'], 2)}, n = {fit['n']}"))
+    if ko:
+        zeilen.append(("Aus der Kopplungsmatrix", f"Z_N ≈ {z(ko['z_n'], 3, 'Ω')}, Z_L ≈ "
+                       + " / ".join(z(w, 3) for w in ko["z_l"]) + " Ω (L1/L2/L3)"))
+    if zu:
+        zeilen.append(("Erwartet aus der Zuleitung", f"R_N {z(zu['r_n'][0], 3)}–{z(zu['r_n'][1], 3)} Ω, "
+                       f"R_L {z(zu['r_l'][0], 3)}–{z(zu['r_l'][1], 3)} Ω (20–70 °C)"))
+    t = ['<section class="karte"><h2>Neutralleiter und Sternpunkt (berechnet)</h2><dl class="liste">'
+         + "".join(f"<dt>{e(a)}</dt><dd>{e(b)}</dd>" for a, b in zeilen) + "</dl>"]
+    if mit_streuung:
+        t.append('<div id="streuung"></div>')
+    t.append("<p class='hinweis'>Der Pro 3EM misst den Neutralleiter nicht. Der N-Strom ist die Zeigersumme der drei "
+             "Außenleiterströme (nur Grundschwingung, Oberschwingungen fehlen, daher eine Untergrenze). Die "
+             "Sternpunktverschiebung folgt aus den drei Spannungen L–N unter der Annahme gleich großer "
+             "Außenleiterspannungen. Die Steigung enthält neben Z_N auch etwa ⅔ des Außenleiterwiderstands; die "
+             "Kopplungsmatrix trennt beides.</p></section>")
+    return "".join(t)
 
 
 def bewertung(r, k):
@@ -557,6 +969,7 @@ def bewertung(r, k):
         if st == "krit":
             text += " Zusammen mit Über- und Unterspannung zugleich: Neutralleiter prüfen lassen."
         zeilen.append((st, "Unsymmetrie", text))
+    zeilen.append(neutral_bewertung(r))
     if r.get("schieflast_max") is not None:
         st = "ok" if r["schieflast_max"] <= SCHIEFLAST_A else "warn"
         zeilen.append((st, "Schieflast", f"Größte Stromdifferenz zwischen den Phasen {z(r['schieflast_max'])} A "
@@ -570,6 +983,10 @@ def bewertung(r, k):
         else:
             zeilen.append(("ok", "Frequenz", f"{z(fr['min'], 3)}–{z(fr['max'], 3)} Hz, stabil."))
     return zeilen
+
+
+def eingabe_query(eingabe, modus):
+    return f"von={eingabe['von']}&bis={eingabe['bis']}&modus={modus}"
 
 
 def bericht_html(r, v, k, eingabe, download):
@@ -628,7 +1045,7 @@ def bericht_html(r, v, k, eingabe, download):
         t.append("</tbody></table></div>")
         weitere = [("Spannungsunsymmetrie (Näherung über Beträge)", f"max {z(r.get('unsym_max'), 2, '%')}, 95 %-Wert {z(r.get('unsym_95'), 2, '%')}"),
                    ("Schieflast (Differenz der Ø-Ströme)", f"max {z(r.get('schieflast_max'), 1, 'A')}, {z(r.get('schieflast_anteil'), 2, '%')} der Zeit über 20 A"),
-                   ("Neutralleiterstrom", neutralleiter(r))]
+                   ("Neutralleiterstrom (Shelly)", neutralleiter(r))]
         if r.get("frequenz"):
             fr = r["frequenz"]
             weitere.append(("Frequenz", f"{z(fr['min'], 3)} – {z(fr['max'], 3)} Hz, Ø {z(fr['avg'], 3)} Hz, "
@@ -638,6 +1055,7 @@ def bericht_html(r, v, k, eingabe, download):
             weitere.append(("Energie", f"Bezug {z(en['bezug'], 1, 'kWh')}, Einspeisung {z(en['einspeisung'], 1, 'kWh')}, "
                                        f"Blind ind. {z(en['blind_ind'], 1, 'kvarh')}, kap. {z(en['blind_kap'], 1, 'kvarh')}"))
         t.append('<dl class="liste">' + "".join(f"<dt>{e(a)}</dt><dd>{e(b)}</dd>" for a, b in weitere) + "</dl></section>")
+        t.append(neutral_html(r))
 
     t.append('<section class="karte"><h2>Verlauf</h2><div id="diagramme"></div>'
              f'<p class="hinweis">Datenbasis Diagramme: {"Sekundenwerte" if v["quelle"] == "sekunde" else "Minutenwerte des Shelly"}, '
@@ -670,12 +1088,175 @@ def bericht_html(r, v, k, eingabe, download):
              "(Schieflast, Spannungsänderung), IEC 60725 (Referenzimpedanz). Der Shelly ist kein Netzqualitäts-"
              "Messgerät nach EN 61000-4-30; Oberschwingungen und Flicker werden nicht erfasst.</p></section>")
 
+    return seite_bauen(t, r, v, k, eingabe, download, "uebersicht")
+
+
+def tabelle_html(kopf, zeilen, klasse=""):
+    e = html.escape
+    return (f'<div class="scroll"><table class="{klasse}"><thead><tr>' + "".join(f"<th>{e(h)}</th>" for h in kopf)
+            + "</tr></thead><tbody>" + "".join("<tr>" + "".join(f"<td>{e(str(c))}</td>" for c in zeile) + "</tr>"
+                                                for zeile in zeilen) + "</tbody></table></div>")
+
+
+def fachbericht_html(r, fd, v, k, eingabe, download):
+    """Bericht für die Elektrofachkraft: Rohdaten und Methoden, keine Bewertung."""
+    e = html.escape
+    ab = r["abdeckung"]
+    with STATUS_LOCK:
+        geraet = STATUS.get("geraet") or {}
+    t = []
+    kopf = [("Messpunkt", k.messpunkt or "– (in der Konfiguration unter [anlage] messpunkt eintragen)"),
+            ("Messgerät", " · ".join(str(geraet.get(n)) for n in ("model", "app", "ver", "mac") if geraet.get(n)) or "–"),
+            ("Zeitraum", f"{zeit(r['von'], k)} – {zeit(r['bis'], k)}"),
+            ("Minutenwerte (Shelly-Speicher)", f"{ab['minuten']} von {ab['minuten_soll']} "
+                                               f"({z(100 * ab['minuten'] / ab['minuten_soll'], 1, '%')})"),
+            ("Sekundenwerte", f"{ab['sekunden']} von {ab['sekunden_soll']} "
+                              f"({z(100 * ab['sekunden'] / ab['sekunden_soll'], 1, '%')}), Raster {k.intervall} s"),
+            ("Auswertung beruht auf", "Minutenwerten (min/Ø/max des Shelly je Minute)" if r["quelle"] == "minute"
+             else "Sekundenwerten (Momentanwerte)"),
+            ("Eingestellt", f"Vorsicherung {z(k.sicherung, 0, 'A')}, Nennspannung {z(k.nennspannung, 0, 'V')}")]
+    t.append('<section class="karte"><h2>Messung</h2><dl class="liste">'
+             + "".join(f"<dt>{e(a)}</dt><dd>{e(b)}</dd>" for a, b in kopf) + "</dl></section>")
+    if not fd:
+        t.append('<section class="karte"><p>Für diesen Zeitraum liegen keine Daten vor.</p></section>')
+        return seite_bauen(t, r, v, k, eingabe, download, "fach")
+
+    # Perzentile
+    qn = ["Min", "1 %", "5 %", "Median", "95 %", "99 %", "Max"]
+    zeilen = [[p["groesse"], p["phase"], p["einheit"]] + [z(w, 2 if p["einheit"] == "kVA" else 1) for w in p["werte"]]
+              for p in fd["perzentile"]]
+    t.append('<section class="karte"><h2>Verteilung der Messwerte</h2>'
+             + tabelle_html(["Größe", "Phase", "Einheit"] + qn, zeilen, "zahlen")
+             + f"<p class='hinweis'>{fd['n']} {'Minuten' if fd['quelle'] == 'minute' else 'Sekundenwerte'}. "
+               "U/I Minimum und Maximum sind die Extremwerte innerhalb jeder Minute, „Mittel“ der Minutenmittelwert."
+               "</p></section>")
+
+    # 10-Minuten-Statistik
+    zeilen = [[d["phase"], d["n"], z(d["min"]), z(d["p5"]), z(d["p95"]), z(d["max"]), z(d["band"], 2),
+               d["unter_85"]] for d in fd["zehn_min"]]
+    t.append('<section class="karte"><h2>10-Minuten-Mittel der Spannung (EN 50160)</h2>'
+             + tabelle_html(["Phase", "Anzahl", "Min [V]", "5 % [V]", "95 % [V]", "Max [V]", "in 207–253 V [%]",
+                             f"< {z(0.85 * k.nennspannung, 1)} V (−15 %)"], zeilen, "zahlen")
+             + f"<p class='hinweis'>Spannungsunsymmetrie aus 10-min-Mitteln (Näherung über Beträge): max "
+               f"{z(r.get('unsym_max'), 2, '%')}, 95 %-Wert {z(r.get('unsym_95'), 2, '%')}.</p></section>")
+
+    # Kopplungsmatrix
+    ko, zu = r.get("kopplung"), r.get("zuleitung")
+    t.append('<section class="karte"><h2>Kopplung Spannung–Strom (ΔU/ΔI)</h2>')
+    if ko:
+        zeilen = [[f"ΔU {name}"] + [z(ko["matrix"][i][j], 3) for j in range(3)] + [z(ko["r2"][i], 2)]
+                  for i, (_, name) in enumerate(PHASEN)]
+        t.append(tabelle_html(["", "je ΔI L1 [Ω]", "je ΔI L2 [Ω]", "je ΔI L3 [Ω]", "R²"], zeilen, "zahlen"))
+        abgeleitet = [("Z_N ≈ 2 × Mittel der Nebendiagonale", z(ko["z_n"], 3, "Ω")),
+                      ("Z_L ≈ −Diagonale − Z_N", " / ".join(z(w, 3) for w in ko["z_l"]) + " Ω (L1/L2/L3)"),
+                      ("Datenbasis", f"{ko['n']} Änderungen zwischen aufeinanderfolgenden Werten "
+                                     f"({dauer(ko['raster'])}); Streuung ΔI "
+                                     + " / ".join(z(w, 2) for w in ko["streuung_di"]) + " A")]
+        t.append('<dl class="liste">' + "".join(f"<dt>{e(a)}</dt><dd>{e(b)}</dd>" for a, b in abgeleitet) + "</dl>")
+        t.append("<p class='hinweis'>Mehrfache Regression ΔU(k) = c + Σ M(k,j)·ΔI(j). Ohmsches, linearisiertes Modell: "
+                 "Diagonale ≈ −(Z_L + Z_N), Nebendiagonale ≈ +½·Z_N (Sternpunktverschiebung hebt die anderen Phasen). "
+                 "Enthalten ist der gesamte Weg bis zur Spannungsquelle (Zuleitung, vorgelagerte UV, Netz). "
+                 "Blindanteile und Lastschwankungen anderer Abnehmer gehen als Streuung ein (R²).</p>")
+    else:
+        t.append("<p>Zu wenige aufeinanderfolgende Werte mit Laständerung.</p>")
+    t.append("</section>")
+
+    # Laststufen
+    zeilen = [[d["name"], d["z_stufen"], z(d["z"], 3) if d["z"] else "–", z(d.get("schaltstufe"), 0)]
+              for d in r["phasen"].values()]
+    t.append('<section class="karte"><h2>Impedanz aus Laststufen (Sekundenwerte)</h2>'
+             + tabelle_html(["Phase", "Stufen ≥ " + z(k.min_stufe, 0, "A"), "Median −ΔU/ΔI [Ω]",
+                             "ΔI für 3 % ΔU [A]"], zeilen, "zahlen")
+             + "<p class='hinweis'>Sprünge des Stroms einer Phase zwischen zwei Sekundenwerten, während sich die anderen "
+               "Phasen um weniger als die halbe Stufe ändern. Entspricht der Schleifenimpedanz L–N.</p></section>")
+
+    # Zuleitung
+    if zu:
+        zeilen = [["Außenleiter R_L", z(zu["r_l"][0], 3), z(zu["r_l"][1], 3)],
+                  ["Neutralleiter R_N", z(zu["r_n"][0], 3), z(zu["r_n"][1], 3)],
+                  ["Schleife R_L + R_N", z(zu["schleife"][0], 3), z(zu["schleife"][1], 3)],
+                  ["Erwartete Steigung R_N + ⅔·R_L", z(zu["steigung"][0], 3), z(zu["steigung"][1], 3)]]
+        t.append(f'<section class="karte"><h2>Zuleitung zum Messpunkt (aus der Konfiguration)</h2>'
+                 f'<p>{e(z(zu["laenge_m"], 0))} m, {e(zu["material"])}, Außenleiter {e(z(zu["querschnitt_mm2"], 1))} mm², '
+                 f'Neutralleiter {e(z(zu["querschnitt_n_mm2"], 1))} mm²</p>'
+                 + tabelle_html(["", "20 °C [Ω]", "70 °C [Ω]"], zeilen, "zahlen")
+                 + f"<p class='hinweis'>Nur ohmsch, ohne vorgelagerte Verteilung und Netz. Reaktanz zusätzlich etwa "
+                   f"{z(zu['x_l'], 3)} Ω je Leiter (0,08 Ω/km).</p></section>")
+
+    # Neutralleiter
+    ne = r.get("neutral")
+    if ne:
+        t.append(neutral_html(r))
+        zeilen = [[f"{kl['von']}–{kl['bis']}", kl["n"], z(kl["median"]), z(kl["p95"])] for kl in ne["klassen"]]
+        t.append('<section class="karte"><h2>Sternpunktverschiebung nach N-Strom-Klassen</h2>'
+                 + tabelle_html(["N-Strom [A]", "Anzahl", "Verschiebung Median [V]", "95 % [V]"], zeilen, "zahlen")
+                 + "</section>")
+
+    # Extremminuten
+    def extrem(zeilen_):
+        return [[zeit(x["ts"], k, "%d.%m.%Y %H:%M")] + [z(w) for w in x["umin"]] + [z(w) for w in x["uavg"]]
+                + [z(w) for w in x["umax"]] + [z(w) for w in x["iavg"]] + [z(x["n"]), z(x["sp"])] for x in zeilen_]
+    kopf_ex = (["Zeit"] + [f"U min {n}" for _, n in PHASEN] + [f"U Ø {n}" for _, n in PHASEN]
+               + [f"U max {n}" for _, n in PHASEN] + [f"I Ø {n}" for _, n in PHASEN] + ["I(N) ber.", "Verschiebung"])
+    t.append('<section class="karte"><h2>Minuten mit der niedrigsten Spannung</h2>'
+             + tabelle_html(kopf_ex, extrem(fd["tiefste"]), "zahlen klein")
+             + "<p class='hinweis'>Alle drei Phasen zur selben Minute: steigt eine Phase, während eine andere einbricht, "
+               "verschiebt sich der Sternpunkt.</p></section>")
+    t.append('<section class="karte"><h2>Minuten mit der höchsten Spannung</h2>'
+             + tabelle_html(kopf_ex, extrem(fd["hoechste"]), "zahlen klein") + "</section>")
+
+    # Tagesprofil
+    zeilen = [[f"{h['stunde']:02d}:00", h["n"]] + [z(h[n]["uavg"]) for _, n in PHASEN]
+              + [z(h[n]["umin"]) for _, n in PHASEN] + [z(h[n]["iavg"]) for _, n in PHASEN]
+              for h in fd["tagesprofil"]]
+    t.append('<section class="karte"><h2>Tagesprofil (Ortszeit)</h2>'
+             + tabelle_html(["Stunde", "Werte"] + [f"U Ø {n}" for _, n in PHASEN] + [f"U min {n}" for _, n in PHASEN]
+                            + [f"I Ø {n}" for _, n in PHASEN], zeilen, "zahlen klein") + "</section>")
+
+    t.append('<section class="karte"><h2>Verlauf</h2><div id="diagramme"></div>'
+             f'<p class="hinweis">Datenbasis: {"Sekundenwerte" if v["quelle"] == "sekunde" else "Minutenwerte"}, '
+             f'verdichtet auf {dauer(v["schritt"])} je Punkt (Mittelwert, Minimum bzw. Maximum je Punkt).</p></section>')
+
+    # Ereignisse ungekürzt als Rohliste
+    zeilen = [[zeit(ev["start"], k, "%d.%m.%Y %H:%M:%S"), dauer(max(k.intervall, ev["ende"] - ev["start"])), ev["art"],
+               ", ".join(ev["phasen"]), z(ev["extrem"], 3 if ev["art"] == "Frequenz" else 1)] for ev in r["ereignisse"]]
+    t.append('<section class="karte"><h2>Grenzwertverletzungen</h2>'
+             + (tabelle_html(["Beginn", "Dauer", "Art", "Phase", "Extremwert"], zeilen, "zahlen klein") if zeilen
+                else "<p>Keine.</p>")
+             + "<p class='hinweis'>Minuten mit U min &lt; 207 V bzw. U max &gt; 253 V, getrennt nach Art; "
+               "aufeinanderfolgende Minuten zusammengefasst.</p></section>")
+
+    t.append("<section class='karte'><h2>Methoden und Annahmen</h2><ul class='methoden'>"
+             "<li>Messgerät Shelly Pro 3EM, kein Netzqualitäts-Messgerät nach EN 61000-4-30. Keine Oberschwingungen, kein "
+             "Flicker, kein Neutralleiterstrom, keine Spannung N–PE, keine Außenleiterspannungen.</li>"
+             "<li>N-Strom: Zeigersumme der Außenleiterströme, Winkel aus Wirk- und Blindenergie je Minute "
+             "(Rechtsdrehfeld angenommen). Nur Grundschwingung.</li>"
+             "<li>Sternpunktverschiebung: aus den drei Spannungen L–N unter der Annahme gleich großer "
+             "Außenleiterspannungen (3(a⁴+b⁴+c⁴+s⁴) = (a²+b²+c²+s²)²).</li>"
+             "<li>Kopplungsmatrix: Regression der Änderungen aufeinanderfolgender Mittelwerte; ohmsches, linearisiertes "
+             "Modell.</li>"
+             "<li>Unsymmetrie: (größte Abweichung vom Mittel) / Mittel der 10-min-Mittelwerte, ohne Phasenwinkel.</li>"
+             "</ul><p class='hinweis'>Rohdaten: CSV-Export oben (Minuten- und Sekundenwerte, Spalten wie vom Shelly "
+             "geliefert, berechnete Größen mit Präfix calc_).</p></section>")
+    return seite_bauen(t, r, v, k, eingabe, download, "fach")
+
+
+def seite_bauen(t, r, v, k, eingabe, download, modus):
+    e = html.escape
     with STATUS_LOCK:
         st = dict(STATUS)
-    daten = json.dumps({"verlauf": v, "von": r["von"], "bis": r["bis"], "sicherung": k.sicherung, "zeitzone": str(k.zeitzone), "live": not download},
-                       separators=(",", ":"))
+    ne = r.get("neutral") or {}
+    daten = json.dumps({"verlauf": v, "von": r["von"], "bis": r["bis"], "sicherung": k.sicherung,
+                        "zeitzone": str(k.zeitzone), "live": not download, "streuung": ne.get("punkte"),
+                        "fit": ne.get("fit")}, separators=(",", ":"))
     ersetzen = {
         "__TITEL__": e(k.name),
+        "__ART__": "Fachbericht" if modus == "fach" else "Netzbericht",
+        "__MESSPUNKT__": e(k.messpunkt) if k.messpunkt else "",
+        "__MODUS__": modus,
+        "__UMSCHALTEN__": (f'<a class="knopf" href="?{e(eingabe_query(eingabe, "uebersicht"))}">Übersicht</a>'
+                           if modus == "fach" else
+                           f'<a class="knopf" href="?{e(eingabe_query(eingabe, "fach"))}">Fachkraft-Ansicht</a>'),
         "__ZEITRAUM__": f"{zeit(r['von'], k)} – {zeit(r['bis'], k)}",
         "__ERSTELLT__": datetime.now(k.zeitzone).strftime("%d.%m.%Y %H:%M"),
         "__VON__": e(eingabe["von"]), "__BIS__": e(eingabe["bis"]),
@@ -683,7 +1264,7 @@ def bericht_html(r, v, k, eingabe, download):
         "__STATUS__": e(f"Letzte Messung {zeit(st['letzte_messung'], k, '%H:%M:%S')}, letzter Abgleich "
                         f"{zeit(st['letzter_abgleich'], k, '%H:%M')}, Fehler seit Start {st['fehler_seit_start']}"
                         + (f" – {st['letzter_fehler']}" if st["letzter_fehler"] else "")),
-        "__QUERY__": e(f"von={eingabe['von']}&bis={eingabe['bis']}"),
+        "__QUERY__": e(eingabe_query(eingabe, modus)),
         "__STEUERUNG__": "" if not download else "versteckt",
         "__INHALT__": "\n".join(t),
         "__DATEN__": daten.replace("</", "<\\/"),
@@ -696,7 +1277,7 @@ def bericht_html(r, v, k, eingabe, download):
 
 SEITE = r"""<!doctype html>
 <html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Netzbericht __TITEL__</title>
+<title>__ART__ __TITEL__</title>
 <style>
 :root{color-scheme:light;--bg:#f4f4f2;--surface:#fcfcfb;--line:#e4e3df;--grid:#ecebe7;--text:#0b0b0b;--text2:#52514e;--muted:#7a7975;
 --s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--ref:#9a9994;--ok:#008300;--warn:#b87900;--krit:#d03b3b;--accent:#2a78d6}
@@ -742,17 +1323,23 @@ dl.liste dt{color:var(--text2)}dl.liste dd{margin:0}
 .tip{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:6px 9px;font-size:12px;
 box-shadow:0 2px 10px rgba(0,0,0,.12);white-space:nowrap;font-variant-numeric:tabular-nums;display:none;z-index:2}
 .tip .z{color:var(--text2);margin-bottom:3px}.tip div{display:flex;gap:6px;align-items:center}.tip i{width:12px;height:2px;display:inline-block}
+table.zahlen td{text-align:right}table.zahlen td:first-child{text-align:left}
+table.klein{font-size:12.5px}table.klein th,table.klein td{padding:5px 8px 5px 0}
+.messpunkt:empty{display:none}.messpunkt{margin:2px 0 4px!important;color:var(--text)!important}
+ul.methoden{margin:0;padding-left:18px}ul.methoden li{margin:4px 0}
 @media (max-width:600px){dl.liste{grid-template-columns:1fr}dl.liste dd{margin-bottom:6px}}
 </style></head><body><main>
-<header><h1>Netzbericht __TITEL__</h1><p>__ZEITRAUM__ · Sicherung __SICHERUNG__ · erstellt __ERSTELLT__</p>
+<header><h1>__ART__ __TITEL__</h1><p class="messpunkt">__MESSPUNKT__</p><p>__ZEITRAUM__ · Sicherung __SICHERUNG__ · erstellt __ERSTELLT__</p>
 <p class="hinweis __STEUERUNG__">__STATUS__</p></header>
 <form class="steuerung __STEUERUNG__" method="get" action="./">
 <label>Von<input type="datetime-local" name="von" value="__VON__"></label>
 <label>Bis<input type="datetime-local" name="bis" value="__BIS__"></label>
+<input type="hidden" name="modus" value="__MODUS__">
 <button class="primaer" type="submit">Bericht erstellen</button>
 <div class="knoepfe">
-<a class="knopf" href="?zeitraum=1h">1 h</a><a class="knopf" href="?zeitraum=24h">24 h</a><a class="knopf" href="?zeitraum=7d">7 Tage</a>
-<a class="knopf" href="?zeitraum=30d">30 Tage</a><a class="knopf" href="?zeitraum=alles">Alles</a></div>
+<a class="knopf" href="?zeitraum=1h&modus=__MODUS__">1 h</a><a class="knopf" href="?zeitraum=24h&modus=__MODUS__">24 h</a><a class="knopf" href="?zeitraum=7d&modus=__MODUS__">7 Tage</a>
+<a class="knopf" href="?zeitraum=30d&modus=__MODUS__">30 Tage</a><a class="knopf" href="?zeitraum=alles&modus=__MODUS__">Alles</a></div>
+<div class="knoepfe">__UMSCHALTEN__</div>
 <div class="knoepfe"><a class="knopf" href="?__QUERY__&download=1">Als HTML speichern</a>
 <a class="knopf" href="export.csv?tabelle=minute&__QUERY__">CSV Minuten</a><a class="knopf" href="export.csv?tabelle=sekunde&__QUERY__">CSV Sekunden</a></div>
 </form>
@@ -835,6 +1422,47 @@ function diagramm(ziel,c){
     function weg(){tip.style.display='none';hair.setAttribute('visibility','hidden');punkte.forEach(p=>p.setAttribute('visibility','hidden'))}
     hit.addEventListener('pointermove',zeigen);hit.addEventListener('pointerdown',zeigen);hit.addEventListener('pointerleave',weg)}
   zeichnen();let rt;new ResizeObserver(()=>{clearTimeout(rt);rt=setTimeout(zeichnen,120)}).observe(box)}
+function streu(ziel,c){
+  const box=document.createElement('div');box.className='diagramm';ziel.appendChild(box);
+  const h=document.createElement('h3');h.textContent=c.titel;box.appendChild(h);
+  const l=document.createElement('div');l.className='legende';
+  [['Messwerte','var(--s1)'],['Ausgleichsgerade','var(--s2)']].forEach(([n,f])=>{if(n==='Ausgleichsgerade'&&!c.fit)return;
+    const sp=document.createElement('span'),i=document.createElement('i');i.style.background=f;sp.append(i,document.createTextNode(n));l.appendChild(sp)});
+  box.appendChild(l);
+  const tip=document.createElement('div');tip.className='tip';box.appendChild(tip);
+  function zeichnen(){
+    box.querySelectorAll('svg').forEach(s=>s.remove());
+    const W=Math.max(300,box.clientWidth),H=260,m={l:44,r:12,t:8,b:30},iw=W-m.l-m.r,ih=H-m.t-m.b;
+    const xhi=Math.max(1,...c.x)*1.05,yhi=Math.max(1,...c.y)*1.08,x=v=>m.l+v/xhi*iw,y=v=>m.t+(1-v/yhi)*ih;
+    const svg=el('svg',{viewBox:`0 0 ${W} ${H}`,role:'img','aria-label':c.titel});box.insertBefore(svg,tip);
+    niceTicks(0,yhi,4).a.forEach(v=>{el('line',{x1:m.l,x2:W-m.r,y1:y(v),y2:y(v),stroke:'var(--grid)'},svg);
+      const tx=el('text',{x:m.l-6,y:y(v)+4,'text-anchor':'end'},svg);tx.textContent=zahl(v,1)});
+    niceTicks(0,xhi,6).a.forEach(v=>{el('line',{x1:x(v),x2:x(v),y1:m.t+ih,y2:m.t+ih+4,stroke:'var(--line)'},svg);
+      const tx=el('text',{x:x(v),y:m.t+ih+16,'text-anchor':'middle'},svg);tx.textContent=zahl(v,0)});
+    const ax=el('text',{x:W-m.r,y:H-2,'text-anchor':'end'},svg);ax.textContent=c.xtitel;
+    el('line',{x1:m.l,x2:W-m.r,y1:m.t+ih,y2:m.t+ih,stroke:'var(--line)'},svg);
+    const g=el('g',{fill:'var(--s1)','fill-opacity':0.45},svg);
+    c.x.forEach((v,i)=>el('circle',{cx:x(v).toFixed(1),cy:y(c.y[i]).toFixed(1),r:2.5},g));
+    if(c.fit){const x2=xhi/1.05;el('line',{x1:x(0),y1:y(c.fit.u0),x2:x(x2),y2:y(c.fit.u0+c.fit.z*x2),stroke:'var(--s2)','stroke-width':2,'stroke-linecap':'round'},svg);
+      const tx=el('text',{x:x(x2)-4,y:y(c.fit.u0+c.fit.z*x2)-6,'text-anchor':'end'},svg);tx.textContent='Steigung '+zahl(c.fit.z,3)+' Ω'}
+    const mark=el('circle',{r:5,fill:'var(--s1)',stroke:'var(--surface)','stroke-width':2,visibility:'hidden'},svg);
+    const hit=el('rect',{x:m.l,y:m.t,width:iw,height:ih,fill:'transparent'},svg);
+    function zeigen(ev){const b=svg.getBoundingClientRect(),px=(ev.clientX-b.left)*W/b.width,py=(ev.clientY-b.top)*H/b.height;
+      let best=-1,bd=Infinity;c.x.forEach((v,i)=>{const d=(x(v)-px)**2+(y(c.y[i])-py)**2;if(d<bd){bd=d;best=i}});
+      if(best<0||bd>400){weg();return}
+      mark.setAttribute('cx',x(c.x[best]));mark.setAttribute('cy',y(c.y[best]));mark.setAttribute('visibility','visible');
+      tip.replaceChildren();const k=document.createElement('div');k.className='z';k.textContent=fVoll.format(new Date(c.t[best]*1000));tip.appendChild(k);
+      [[zahl(c.x[best],1)+' A','N-Strom'],[zahl(c.y[best],1)+' V','Verschiebung']].forEach(([w,n])=>{const d=document.createElement('div'),s=document.createElement('strong');
+        s.textContent=w;d.append(s,document.createTextNode(' '+n));tip.appendChild(d)});
+      tip.style.display='block';const tb=tip.getBoundingClientRect(),bb=box.getBoundingClientRect(),sx=b.left-bb.left+x(c.x[best])*b.width/W;
+      tip.style.left=Math.max(0,Math.min(bb.width-tb.width,sx+(sx+tb.width+16>bb.width?-tb.width-12:12)))+'px';
+      tip.style.top=(b.top-bb.top+8)+'px'}
+    function weg(){tip.style.display='none';mark.setAttribute('visibility','hidden')}
+    hit.addEventListener('pointermove',zeigen);hit.addEventListener('pointerdown',zeigen);hit.addEventListener('pointerleave',weg)}
+  zeichnen();let rt;new ResizeObserver(()=>{clearTimeout(rt);rt=setTimeout(zeichnen,120)}).observe(box)}
+const zs=document.getElementById('streuung');
+if(zs&&D.streuung&&D.streuung.x.length)streu(zs,{titel:'Sternpunktverschiebung über berechnetem N-Strom',xtitel:'N-Strom [A]',
+  x:D.streuung.x,y:D.streuung.y,t:D.streuung.t,fit:D.fit});
 const ziel=document.getElementById('diagramme');
 if(ziel){const raster=V.quelle==='minute'?60:1,ph=n=>PH.map(p=>({name:p,farbe:FARBE[p],werte:V[n][p]}));
   const uZusatz=i=>PH.map(p=>p+': min '+zahl(V.umin[p][i],1)+' / max '+zahl(V.umax[p][i],1)+' V');
@@ -849,7 +1477,12 @@ if(ziel){const raster=V.quelle==='minute'?60:1,ph=n=>PH.map(p=>({name:p,farbe:FA
   if(V.f.t.length)diagramm(ziel,{titel:'Netzfrequenz (Linie Mittelwert, Fläche min–max)',einheit:'Hz',nk:3,t:V.f.t,schritt:V.f.schritt,raster:1,
     reihen:[{name:'Mittelwert',farbe:'var(--s1)',werte:V.f.avg}],band:{min:V.f.min,max:V.f.max,farbe:'var(--s1)'},
     refs:[{wert:50,text:'50 Hz',immer:true},{wert:49.8,text:'49,8 Hz'},{wert:50.2,text:'50,2 Hz'}],
-    zusatz:i=>['min '+zahl(V.f.min[i],3)+' / max '+zahl(V.f.max[i],3)+' Hz']})}
+    zusatz:i=>['min '+zahl(V.f.min[i],3)+' / max '+zahl(V.f.max[i],3)+' Hz']});
+  if(V.n.some(x=>x!=null)){
+    diagramm(ziel,{titel:'Neutralleiterstrom, berechnet (Grundschwingung, Maximum)',einheit:'A',nk:1,t:V.t,schritt:V.schritt,raster,null:true,
+      reihen:[{name:'N',farbe:'var(--s1)',werte:V.n}]});
+    diagramm(ziel,{titel:'Sternpunktverschiebung (Maximum)',einheit:'V',nk:1,t:V.t,schritt:V.schritt,raster,null:true,
+      reihen:[{name:'Verschiebung',farbe:'var(--s1)',werte:V.sp}]})}}
 if(D.live){const box=document.getElementById('live');
   async function holen(){try{const r=await fetch('api/live',{cache:'no-store'});const d=await r.json();if(!d)return;box.replaceChildren();
     const feld=(titel,text,farbe)=>{const e=document.createElement('div'),b=document.createElement('b');if(farbe)e.style.borderColor=farbe;
@@ -943,16 +1576,27 @@ def webserver(k):
                     if pfad == "/api/bericht":
                         return self.senden(200, "application/json",
                                            json.dumps(bericht(con, von, bis, kk), default=sorted))
+                    if pfad == "/api/fachdaten":
+                        r = bericht(con, von, bis, kk)
+                        return self.senden(200, "application/json", json.dumps(
+                            {"bericht": r, "fachdaten": fachdaten(con, von, bis, kk, r["quelle"])}, default=sorted))
                     if pfad == "/api/verlauf":
                         return self.senden(200, "application/json", json.dumps(verlauf(con, von, bis, kk)))
                     if pfad == "/export.csv":
                         return self.export(con, von, bis, kk, (params.get("tabelle") or ["minute"])[0])
                     if pfad == "/":
                         download = bool(params.get("download"))
-                        seite = bericht_html(bericht(con, von, bis, kk), verlauf(con, von, bis, kk), kk, eingabe, download)
+                        fach = (params.get("modus") or [""])[0] == "fach"
+                        r = bericht(con, von, bis, kk)
+                        v = verlauf(con, von, bis, kk)
+                        if fach:
+                            seite = fachbericht_html(r, fachdaten(con, von, bis, kk, r["quelle"]), v, kk, eingabe, download)
+                        else:
+                            seite = bericht_html(r, v, kk, eingabe, download)
                         kopf = {}
                         if download:
-                            name = f"netzbericht_{datetime.fromtimestamp(von, kk.zeitzone):%Y%m%d-%H%M}_" \
+                            name = f"{'fachbericht' if fach else 'netzbericht'}_" \
+                                   f"{datetime.fromtimestamp(von, kk.zeitzone):%Y%m%d-%H%M}_" \
                                    f"{datetime.fromtimestamp(bis, kk.zeitzone):%Y%m%d-%H%M}.html"
                             kopf["Content-Disposition"] = f'attachment; filename="{name}"'
                         return self.senden(200, "text/html; charset=utf-8", seite, kopf)

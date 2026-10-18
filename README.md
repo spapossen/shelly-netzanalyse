@@ -3,7 +3,7 @@
 Ein Dienst für einen Proxmox-LXC, der aus einem Shelly Pro 3EM alle Daten sammelt, die man für zwei Fragen
 braucht:
 
-1. **Wie viel Last darf noch an den Anschluss?** Lastreserve je Phase bis zur Hausanschlusssicherung und bis zur
+1. **Wie viel Last darf noch an den Anschluss?** Lastreserve je Phase bis zur Vorsicherung des Messpunkts und bis zur
    Spannungsgrenze von 207 V.
 2. **Wie stabil ist das Netz am Messpunkt?** Spannungsband, Einbrüche, Netzimpedanz, Unsymmetrie, Schieflast
    und Frequenz.
@@ -20,7 +20,7 @@ Auf dem Proxmox-Host als root:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/spapossen/shelly-netzanalyse/main/proxmox-lxc.sh)"
 ```
 
-Das Skript fragt nach der IP des Shelly und dem Nennstrom der Hausanschlusssicherung. Container-ID, Speicher,
+Das Skript fragt nach der IP des Shelly und dem Nennstrom der Vorsicherung des Messpunkts. Container-ID, Speicher,
 Netzwerk (DHCP oder feste IP, optional VLAN), Größe und RAM sind sinnvoll vorbelegt. Danach erledigt es
 Folgendes:
 
@@ -94,11 +94,36 @@ Unter `http://<container-ip>:8080/` gibt es:
 Spannung zum Zeitpunkt des Spitzenstroms auf 207 V fiele. Gerechnet wird für eine einphasige Last mit der
 Schleifenimpedanz L–N. Bei symmetrischer Drehstromlast fällt die Spannung etwa halb so stark.
 
+**Neutralleiter und Sternpunkt (berechnet):** Der Pro 3EM misst den Neutralleiter nicht. Der Dienst rechnet ihn
+deshalb aus den drei Außenleiterströmen und ihren Phasenwinkeln (nur Grundschwingung, also eine Untergrenze).
+Aus den drei Spannungen L–N bestimmt er außerdem, wie weit sich der Sternpunkt verschiebt. Das Streudiagramm
+„Verschiebung über N-Strom“ und eine Kopplungsmatrix ΔU/ΔI liefern Schätzwerte für die Widerstände von
+Neutral- und Außenleiter. Das gilt rückwirkend für die ganze Historie: Vorhandene Daten werden nach einem Update
+einmalig nachberechnet.
+
+**Zuleitung:** Liegt der Messpunkt hinter einer langen Zuleitung, trage in der Konfiguration unter `[zuleitung]`
+Länge, Querschnitt und Material ein. Der Bericht vergleicht dann die gemessenen Impedanzen mit den
+Leitungswiderständen und zeigt, ob die Zuleitung den Spannungsfall erklärt oder ob mehr dahintersteckt
+(z. B. eine schlechte Klemme).
+
+**Fachkraft-Ansicht** (Knopf „Fachkraft-Ansicht“ bzw. `?modus=fach`): Rohdaten ohne Ampel und ohne Deutung,
+für die Beurteilung durch eine Elektrofachkraft. Sie enthält:
+
+- Messpunkt, Gerät und Datenbasis,
+- Perzentile aller Größen je Phase und die 10-min-Statistik nach EN 50160,
+- Kopplungsmatrix ΔU/ΔI und Impedanz aus Laststufen,
+- erwartete Werte der Zuleitung,
+- Klassen von N-Strom und Sternpunktverschiebung,
+- die Minuten mit der niedrigsten und höchsten Spannung (alle Phasen gleichzeitig),
+- Tagesprofil, Liste der Grenzwertverletzungen und offengelegte Methoden.
+
+Als HTML-Datei speicherbar, die Daten gibt es auch als JSON unter `api/fachdaten`.
+
 **Netzimpedanz:** Sie braucht klare Laststufen ab 8 A auf einer Phase, während die anderen Phasen ruhig
 bleiben. Fehlen sie, schalte bei laufendem Dienst ein paar Mal eine große Last ein und aus, etwa einen
 Wasserkocher oder ein Heizgerät.
 
-Dieselben Daten gibt es als JSON unter `api/bericht`, `api/verlauf`, `api/live` und `api/status`, mit den
+Dieselben Daten gibt es als JSON unter `api/bericht`, `api/fachdaten`, `api/verlauf`, `api/live` und `api/status`, mit den
 Parametern `von`/`bis` (z. B. `2026-10-18T08:00`) oder `zeitraum=1h|24h|7d|30d|alles`.
 
 ## Betrieb
