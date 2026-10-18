@@ -128,7 +128,7 @@ class NeutralleiterTest(unittest.TestCase):
         import random
         zufall = random.Random(7)
         cls.k = sm.Konfig(None)
-        cls.k.zuleitung_m, cls.k.zuleitung_mm2, cls.k.zuleitung_n_mm2 = 250, 25, 25
+        cls.k.zuleitung = [{"laenge_m": 250, "mm2": 25, "mm2_n": 25, "material": "cu", "name": ""}]
         cls.con = sm.verbinden(":memory:")
         cls.start = 1_700_000_040
         stroeme = [10.0, 10.0, 10.0]
@@ -180,6 +180,20 @@ class NeutralleiterTest(unittest.TestCase):
         self.con.execute("UPDATE minute SET calc_version = NULL, calc_sternpunkt = NULL")
         self.assertEqual(sm.nachberechnen(self.con), 3000)
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM minute WHERE calc_sternpunkt IS NULL").fetchone()[0], 0)
+
+    def test_zuleitung_aus_mehreren_abschnitten(self):
+        import configparser
+        cp = configparser.ConfigParser()
+        cp.read_string("[zuleitung]\nabschnitt1 = 150, 35, al, UV Halle\nabschnitt2 = 100, 70, al, Hauptverteilung\n")
+        k = sm.Konfig(None)
+        k.zuleitung = sm.abschnitte_lesen(cp)
+        zu = sm.zuleitung(k)
+        self.assertEqual([a["name"] for a in zu["abschnitte"]], ["UV Halle", "Hauptverteilung"])
+        self.assertAlmostEqual(zu["r_l"][0], 0.150 * 0.868 + 0.100 * 0.443, places=6)
+        self.assertAlmostEqual(zu["laenge_m"], 250)
+        cp = configparser.ConfigParser()
+        cp.read_string("[zuleitung]\nlaenge_m = 250\nquerschnitt_mm2 = 25\nmaterial = cu\n")
+        self.assertEqual(sm.abschnitte_lesen(cp)[0]["mm2_n"], 25)
 
     def test_fachdaten(self):
         fd = sm.fachdaten(self.con, self.start, self.start + 60 * 3000, self.k, "minute")

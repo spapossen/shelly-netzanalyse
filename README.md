@@ -102,7 +102,8 @@ Neutral- und Außenleiter. Das gilt rückwirkend für die ganze Historie: Vorhan
 einmalig nachberechnet.
 
 **Zuleitung:** Liegt der Messpunkt hinter einer langen Zuleitung, trage in der Konfiguration unter `[zuleitung]`
-Länge, Querschnitt und Material ein. Der Bericht vergleicht dann die gemessenen Impedanzen mit den
+die Abschnitte bis zur Einspeisung ein, je Abschnitt Länge, Querschnitt und Material, z. B.
+`abschnitt1 = 150, 35, al, UV Nord → UV Halle`. Die Leiterwiderstände stammen aus DIN EN 60228. Der Bericht vergleicht dann die gemessenen Impedanzen mit den
 Leitungswiderständen und zeigt, ob die Zuleitung den Spannungsfall erklärt oder ob mehr dahintersteckt
 (z. B. eine schlechte Klemme).
 

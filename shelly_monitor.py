@@ -63,6 +63,40 @@ def status_setzen(**werte):
 
 # --------------------------------------------------------------------------- Konfiguration
 
+def abschnitte_lesen(cp):
+    """Leitungsabschnitte vom Messpunkt aufwärts: abschnitt1 = Länge m, Querschnitt mm², Material[, N mm²][, Name].
+    Die einfache Form laenge_m/querschnitt_mm2/material wird als ein Abschnitt gelesen."""
+    if not cp.has_section("zuleitung"):
+        return []
+    abschnitte = []
+    for schluessel, wert in sorted(cp.items("zuleitung")):
+        if not schluessel.startswith("abschnitt") or not wert.strip():
+            continue
+        teile = [t.strip() for t in wert.split(",")]
+        try:
+            laenge, mm2 = float(teile[0]), float(teile[1])
+        except (IndexError, ValueError):
+            LOG.warning("Zuleitung %s nicht lesbar: %s", schluessel, wert)
+            continue
+        material = (teile[2] if len(teile) > 2 and teile[2] else "cu").lower()
+        mm2_n = mm2
+        name = ""
+        for t in teile[3:]:
+            try:
+                mm2_n = float(t)
+            except ValueError:
+                name = t
+        abschnitte.append({"laenge_m": laenge, "mm2": mm2, "mm2_n": mm2_n, "material": material, "name": name})
+    if not abschnitte:
+        laenge = float(cp.get("zuleitung", "laenge_m", fallback="0") or 0)
+        mm2 = float(cp.get("zuleitung", "querschnitt_mm2", fallback="0") or 0)
+        if laenge and mm2:
+            mm2_n = float(cp.get("zuleitung", "querschnitt_n_mm2", fallback="0") or 0) or mm2
+            abschnitte.append({"laenge_m": laenge, "mm2": mm2, "mm2_n": mm2_n, "name": "",
+                               "material": cp.get("zuleitung", "material", fallback="cu").strip().lower()})
+    return abschnitte
+
+
 class Konfig:
     def __init__(self, pfad):
         cp = configparser.ConfigParser()
@@ -84,10 +118,8 @@ class Konfig:
         self.min_stufe = float(g("anlage", "min_laststufe_a", "8"))
         self.name = g("anlage", "name", "Messpunkt")
         self.messpunkt = g("anlage", "messpunkt", "")
-        self.zuleitung_m = float(g("zuleitung", "laenge_m", "0") or 0)
-        self.zuleitung_mm2 = float(g("zuleitung", "querschnitt_mm2", "0") or 0)
-        self.zuleitung_n_mm2 = float(g("zuleitung", "querschnitt_n_mm2", "0") or 0) or self.zuleitung_mm2
-        self.zuleitung_material = g("zuleitung", "material", "cu").lower()
+        self.netzform = g("anlage", "netzform", "").upper()
+        self.zuleitung = abschnitte_lesen(cp)
         self.zeitzone = ZoneInfo(g("anlage", "zeitzone", "Europe/Berlin"))
 
 
@@ -701,19 +733,40 @@ def kopplung(con, von, bis, tabelle, raster):
             "z_n": z_n, "z_l": [-matrix[k][k] - z_n for k in range(3)]}
 
 
+# Höchstwerte des Leiterwiderstands bei 20 °C in Ω/km, DIN EN 60228 Klasse 2 (mehrdrähtig bzw. sektorförmig)
+LEITER_OHM_KM = {
+    "cu": {1.5: 12.1, 2.5: 7.41, 4: 4.61, 6: 3.08, 10: 1.83, 16: 1.15, 25: 0.727, 35: 0.524, 50: 0.387,
+           70: 0.268, 95: 0.193, 120: 0.153, 150: 0.124, 185: 0.0991, 240: 0.0754, 300: 0.0601},
+    "al": {16: 1.91, 25: 1.20, 35: 0.868, 50: 0.641, 70: 0.443, 95: 0.320, 120: 0.253, 150: 0.206,
+           185: 0.164, 240: 0.125, 300: 0.100},
+}
+TEMPERATURBEIWERT = {"cu": 0.00393, "al": 0.00403}
+
+
+def leiterwiderstand(laenge_m, mm2, material):
+    """Widerstand eines Leiters bei 20 °C; Normwert, sonst aus dem spezifischen Widerstand."""
+    tabelle = LEITER_OHM_KM.get(material, LEITER_OHM_KM["cu"])
+    if mm2 in tabelle:
+        return tabelle[mm2] * laenge_m / 1000
+    return (0.0287 if material == "al" else 0.0178) * laenge_m / mm2
+
+
 def zuleitung(k):
-    """Erwartete Widerstände der Zuleitung zum Messpunkt aus Länge, Querschnitt und Material."""
-    if not (k.zuleitung_m and k.zuleitung_mm2):
+    """Erwartete Widerstände der Zuleitung vom Messpunkt bis zur Einspeisung, Summe über alle Abschnitte."""
+    if not k.zuleitung:
         return None
-    rho, alpha = {"al": (0.0287, 0.00403)}.get(k.zuleitung_material, (0.0178, 0.00393))
-    warm = 1 + alpha * 50
-    r_l = rho * k.zuleitung_m / k.zuleitung_mm2
-    r_n = rho * k.zuleitung_m / k.zuleitung_n_mm2
-    return {"laenge_m": k.zuleitung_m, "querschnitt_mm2": k.zuleitung_mm2, "querschnitt_n_mm2": k.zuleitung_n_mm2,
-            "material": "Al" if k.zuleitung_material == "al" else "Cu",
-            "r_l": [r_l, r_l * warm], "r_n": [r_n, r_n * warm], "schleife": [r_l + r_n, (r_l + r_n) * warm],
-            "x_l": 0.08 * k.zuleitung_m / 1000,
-            "steigung": [r_n + 2 / 3 * r_l, (r_n + 2 / 3 * r_l) * warm]}
+    abschnitte, r_l, r_n, r_l70, r_n70, laenge = [], 0.0, 0.0, 0.0, 0.0, 0.0
+    for a in k.zuleitung:
+        warm = 1 + TEMPERATURBEIWERT.get(a["material"], 0.00393) * 50
+        rl = leiterwiderstand(a["laenge_m"], a["mm2"], a["material"])
+        rn = leiterwiderstand(a["laenge_m"], a["mm2_n"], a["material"])
+        abschnitte.append(dict(a, r_l=[rl, rl * warm], r_n=[rn, rn * warm]))
+        r_l, r_n, r_l70, r_n70 = r_l + rl, r_n + rn, r_l70 + rl * warm, r_n70 + rn * warm
+        laenge += a["laenge_m"]
+    return {"abschnitte": abschnitte, "laenge_m": laenge,
+            "r_l": [r_l, r_l70], "r_n": [r_n, r_n70], "schleife": [r_l + r_n, r_l70 + r_n70],
+            "x_l": 0.08 * laenge / 1000,
+            "steigung": [r_n + 2 / 3 * r_l, r_n70 + 2 / 3 * r_l70]}
 
 
 def fachdaten(con, von, bis, k, tabelle):
@@ -1114,6 +1167,7 @@ def fachbericht_html(r, fd, v, k, eingabe, download):
                               f"({z(100 * ab['sekunden'] / ab['sekunden_soll'], 1, '%')}), Raster {k.intervall} s"),
             ("Auswertung beruht auf", "Minutenwerten (min/Ø/max des Shelly je Minute)" if r["quelle"] == "minute"
              else "Sekundenwerten (Momentanwerte)"),
+            ("Netzform", k.netzform or "–"),
             ("Eingestellt", f"Vorsicherung {z(k.sicherung, 0, 'A')}, Nennspannung {z(k.nennspannung, 0, 'V')}")]
     t.append('<section class="karte"><h2>Messung</h2><dl class="liste">'
              + "".join(f"<dt>{e(a)}</dt><dd>{e(b)}</dd>" for a, b in kopf) + "</dl></section>")
@@ -1172,15 +1226,19 @@ def fachbericht_html(r, fd, v, k, eingabe, download):
 
     # Zuleitung
     if zu:
-        zeilen = [["Außenleiter R_L", z(zu["r_l"][0], 3), z(zu["r_l"][1], 3)],
-                  ["Neutralleiter R_N", z(zu["r_n"][0], 3), z(zu["r_n"][1], 3)],
-                  ["Schleife R_L + R_N", z(zu["schleife"][0], 3), z(zu["schleife"][1], 3)],
-                  ["Erwartete Steigung R_N + ⅔·R_L", z(zu["steigung"][0], 3), z(zu["steigung"][1], 3)]]
-        t.append(f'<section class="karte"><h2>Zuleitung zum Messpunkt (aus der Konfiguration)</h2>'
-                 f'<p>{e(z(zu["laenge_m"], 0))} m, {e(zu["material"])}, Außenleiter {e(z(zu["querschnitt_mm2"], 1))} mm², '
-                 f'Neutralleiter {e(z(zu["querschnitt_n_mm2"], 1))} mm²</p>'
-                 + tabelle_html(["", "20 °C [Ω]", "70 °C [Ω]"], zeilen, "zahlen")
-                 + f"<p class='hinweis'>Nur ohmsch, ohne vorgelagerte Verteilung und Netz. Reaktanz zusätzlich etwa "
+        zeilen = [[a["name"] or f"Abschnitt {i + 1}", z(a["laenge_m"], 0), a["material"].capitalize(), z(a["mm2"], 0),
+                   z(a["mm2_n"], 0), z(a["r_l"][0], 4), z(a["r_l"][1], 4), z(a["r_n"][0], 4), z(a["r_n"][1], 4)]
+                  for i, a in enumerate(zu["abschnitte"])]
+        summe = [["Außenleiter R_L", z(zu["r_l"][0], 3), z(zu["r_l"][1], 3)],
+                 ["Neutral-/PEN-Leiter R_N", z(zu["r_n"][0], 3), z(zu["r_n"][1], 3)],
+                 ["Schleife R_L + R_N", z(zu["schleife"][0], 3), z(zu["schleife"][1], 3)],
+                 ["Erwartete Steigung R_N + ⅔·R_L", z(zu["steigung"][0], 3), z(zu["steigung"][1], 3)]]
+        t.append('<section class="karte"><h2>Zuleitung zum Messpunkt (aus der Konfiguration)</h2>'
+                 + tabelle_html(["Abschnitt", "Länge [m]", "Material", "L [mm²]", "N [mm²]", "R_L 20 °C [Ω]",
+                                 "R_L 70 °C [Ω]", "R_N 20 °C [Ω]", "R_N 70 °C [Ω]"], zeilen, "zahlen klein")
+                 + tabelle_html(["Summe", "20 °C [Ω]", "70 °C [Ω]"], summe, "zahlen")
+                 + f"<p class='hinweis'>Leiterwiderstände nach DIN EN 60228 (Höchstwerte, 20 °C), 70 °C über den "
+                   f"Temperaturbeiwert. Nur ohmsch, ohne Hauptverteilung, Hausanschluss und Netz. Reaktanz zusätzlich etwa "
                    f"{z(zu['x_l'], 3)} Ω je Leiter (0,08 Ω/km).</p></section>")
 
     # Neutralleiter
@@ -1236,6 +1294,9 @@ def fachbericht_html(r, fd, v, k, eingabe, download):
              "<li>Kopplungsmatrix: Regression der Änderungen aufeinanderfolgender Mittelwerte; ohmsches, linearisiertes "
              "Modell.</li>"
              "<li>Unsymmetrie: (größte Abweichung vom Mittel) / Mittel der 10-min-Mittelwerte, ohne Phasenwinkel.</li>"
+             + ("<li>TT-System: N und PE sind in der Anlage getrennt. Eine Messung N–PE an der Unterverteilung unter "
+                "Schieflast zeigt die Verschiebung des N-Potenzials gegen den örtlichen Erder direkt und ergänzt die "
+                "berechnete Sternpunktverschiebung.</li>" if k.netzform == "TT" else "") +
              "</ul><p class='hinweis'>Rohdaten: CSV-Export oben (Minuten- und Sekundenwerte, Spalten wie vom Shelly "
              "geliefert, berechnete Größen mit Präfix calc_).</p></section>")
     return seite_bauen(t, r, v, k, eingabe, download, "fach")
