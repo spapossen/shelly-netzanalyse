@@ -84,6 +84,21 @@ class MonitorTest(Basis):
         stufen = {s for s, _, _ in sm.bewertung(r, self.k)}
         self.assertIn("warn", stufen)
 
+    def test_gleichzeitige_ueber_und_unterspannung_bleiben_getrennt(self):
+        con = sm.verbinden(":memory:")
+        ts = 1_700_000_040
+        zeilen = []
+        for i in range(3):
+            zeile = {"ts": ts + 60 * i}
+            for p, u_min, u_max in (("a", 240, 261), ("b", 225, 230), ("c", 185, 205)):
+                zeile.update({f"{p}_min_voltage": u_min, f"{p}_max_voltage": u_max, f"{p}_avg_voltage": u_min + 5,
+                              f"{p}_max_current": 20, f"{p}_avg_current": 15})
+            zeilen.append(zeile)
+        sm.einfuegen(con, "minute", zeilen)
+        r = sm.bericht(con, ts, ts + 180, self.k)
+        arten = {(e["art"], tuple(e["phasen"])): e["extrem"] for e in r["ereignisse"]}
+        self.assertEqual(arten, {("Überspannung", ("L1",)): 261, ("Unterspannung", ("L3",)): 185})
+
     def test_verlauf(self):
         v = sm.verlauf(self.con, self.jetzt - 7 * 86400, self.jetzt, self.k)
         self.assertEqual(v["quelle"], "minute")

@@ -426,16 +426,17 @@ def bericht(con, von, bis, k):
                 r["ereignisse"].append(e)
 
     # Spannungsereignisse außerhalb 207–253 V
-    teile = []
-    for p, name in PHASEN:
-        teile.append(f"SELECT ts, {f[p]['umin']}, '{name}' FROM {tabelle} WHERE {bereich} AND {f[p]['umin']} < {U_MIN}")
-        teile.append(f"SELECT ts, {f[p]['umax']}, '{name}' FROM {tabelle} WHERE {bereich} AND {f[p]['umax']} > {U_MAX}")
-    punkte = con.execute(" UNION ALL ".join(teile) + " ORDER BY 1 LIMIT 20000", (von, bis) * len(teile)).fetchall()
+    # Unter- und Überspannung getrennt zusammenfassen: gleichzeitig eine Phase zu hoch und eine
+    # andere zu niedrig ist das typische Bild eines hochohmigen Neutralleiters und muss sichtbar bleiben.
     schritt = 60 if tabelle == "minute" else k.intervall
-    for e in episoden(punkte, 2 * schritt, k.nennspannung):
-        e["art"] = "Unterspannung" if e["extrem"] < U_MIN else "Überspannung"
-        e["ende"] += schritt
-        r["ereignisse"].append(e)
+    for art, spalte, vergleich in (("Unterspannung", "umin", f"< {U_MIN}"), ("Überspannung", "umax", f"> {U_MAX}")):
+        teile = [f"SELECT ts, {f[p][spalte]}, '{name}' FROM {tabelle} WHERE {bereich} AND {f[p][spalte]} {vergleich}"
+                 for p, name in PHASEN]
+        punkte = con.execute(" UNION ALL ".join(teile) + " ORDER BY 1 LIMIT 20000", (von, bis) * len(teile)).fetchall()
+        for e in episoden(punkte, 2 * schritt, k.nennspannung):
+            e["art"] = art
+            e["ende"] += schritt
+            r["ereignisse"].append(e)
     r["ereignisse"].sort(key=lambda e: e["start"], reverse=True)
     for e in r["ereignisse"]:
         e["phasen"] = sorted(e["phasen"])
@@ -505,6 +506,14 @@ def dauer(sek):
     return f"{sek / 3600:.1f} h".replace(".", ",")
 
 
+def neutralleiter(r):
+    n_max, schief = r.get("n_max"), r.get("schieflast_max") or 0
+    # Der Pro 3EM hat keinen Wandler im Neutralleiter; ein Wert nahe 0 bei deutlicher Schieflast ist nicht gemessen.
+    if n_max is None or (n_max < 1 and schief > 5):
+        return "vom Shelly nicht gemessen (kein Wandler im Neutralleiter)"
+    return f"max {z(n_max, 1, 'A')}, Ø {z(r.get('n_avg'), 1, 'A')}"
+
+
 def bewertung(r, k):
     zeilen = []
     ph = r["phasen"].values()
@@ -528,6 +537,9 @@ def bewertung(r, k):
                                                   f"(Sicherungen halten das kurz aus, Dauerlast max. {z(dauer15)} A)."))
         elif min(res) < 0.2 * k.sicherung:
             zeilen.append(("warn", "Lastreserve", f"Nur noch {z(min(res), 0)} A Reserve auf der höchstbelasteten Phase."))
+        elif any(not d["z"] for d in ph):
+            zeilen.append(("info", "Lastreserve", f"Mindestens {z(min(res), 0)} A je Phase bis zur Sicherung; ob die "
+                                                  "Spannung das zulässt, zeigt erst die Netzimpedanz."))
         else:
             zeilen.append(("ok", "Lastreserve", f"Mindestens {z(min(res), 0)} A je Phase bis zur Sicherung."))
     zs = [d["z"] for d in ph if d["z"]]
@@ -540,8 +552,11 @@ def bewertung(r, k):
     else:
         zeilen.append(("info", "Netzimpedanz", "Noch zu wenige Laststufen; länger messen oder gezielt Last schalten."))
     if r.get("unsym_95") is not None:
-        st = "ok" if r["unsym_95"] <= UNSYM_MAX else "warn"
-        zeilen.append((st, "Unsymmetrie", f"95 %-Wert {z(r['unsym_95'], 2)} % (Grenze 2 %)."))
+        st = "ok" if r["unsym_95"] <= UNSYM_MAX else "warn" if r["unsym_95"] <= 2 * UNSYM_MAX else "krit"
+        text = f"95 %-Wert {z(r['unsym_95'], 2)} % (Grenze 2 %)."
+        if st == "krit":
+            text += " Zusammen mit Über- und Unterspannung zugleich: Neutralleiter prüfen lassen."
+        zeilen.append((st, "Unsymmetrie", text))
     if r.get("schieflast_max") is not None:
         st = "ok" if r["schieflast_max"] <= SCHIEFLAST_A else "warn"
         zeilen.append((st, "Schieflast", f"Größte Stromdifferenz zwischen den Phasen {z(r['schieflast_max'])} A "
@@ -571,8 +586,10 @@ def bericht_html(r, v, k, eingabe, download):
         t.append("</tbody></table></section>")
 
         z3 = r.get("zusatz_3ph_kw")
+        ohne_z = any(not d["z"] for d in ph.values())
         kacheln = [("Zusätzliche Last, 3-phasig symmetrisch", z(z3, 1, "kW") if z3 is not None else "–",
-                    "begrenzt durch Sicherung und Spannung"),
+                    "nur Sicherung – Spannungsgrenze offen, Netzimpedanz fehlt" if ohne_z
+                    else "begrenzt durch Sicherung und Spannung"),
                    ("Größter Spitzenstrom", z(max((d["imax"] or 0) for d in ph.values()), 1, "A"),
                     f"Sicherung {z(k.sicherung, 0)} A"),
                    ("Niedrigste Spannung", z(min((d["umin"] or 999) for d in ph.values()), 1, "V"), "Grenze 207 V")]
@@ -611,7 +628,7 @@ def bericht_html(r, v, k, eingabe, download):
         t.append("</tbody></table></div>")
         weitere = [("Spannungsunsymmetrie (Näherung über Beträge)", f"max {z(r.get('unsym_max'), 2, '%')}, 95 %-Wert {z(r.get('unsym_95'), 2, '%')}"),
                    ("Schieflast (Differenz der Ø-Ströme)", f"max {z(r.get('schieflast_max'), 1, 'A')}, {z(r.get('schieflast_anteil'), 2, '%')} der Zeit über 20 A"),
-                   ("Neutralleiterstrom", f"max {z(r.get('n_max'), 1, 'A')}, Ø {z(r.get('n_avg'), 1, 'A')}")]
+                   ("Neutralleiterstrom", neutralleiter(r))]
         if r.get("frequenz"):
             fr = r["frequenz"]
             weitere.append(("Frequenz", f"{z(fr['min'], 3)} – {z(fr['max'], 3)} Hz, Ø {z(fr['avg'], 3)} Hz, "
