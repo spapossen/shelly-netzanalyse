@@ -29,6 +29,25 @@ else
   echo "Konfiguration bleibt erhalten: $KONFIG"
 fi
 
+# Alarm-Benachrichtigung über ntfy: NTFY_URL setzt [alarm] ntfy_url (ein bloßes Thema wird zu https://ntfy.sh/<Thema>)
+NTFY_URL="${NTFY_URL:-}"
+if [ -n "$NTFY_URL" ]; then
+  case "$NTFY_URL" in
+    http://*|https://*) ;;
+    *) NTFY_URL="https://ntfy.sh/$NTFY_URL" ;;
+  esac
+  awk -v url="$NTFY_URL" '
+    /^\[/ { if (im && !fertig) { print "ntfy_url = " url; fertig = 1 }
+            im = ($0 ~ /^\[alarm\]/); if (im) gesehen = 1 }
+    im && /^ntfy_url *=/ { if (!fertig) { print "ntfy_url = " url; fertig = 1 }; next }
+    { print }
+    END { if (!gesehen) { print ""; print "[alarm]"; print "ntfy_url = " url }
+          else if (!fertig) print "ntfy_url = " url }' "$KONFIG" > "$KONFIG.neu"
+  cat "$KONFIG.neu" > "$KONFIG"
+  rm -f "$KONFIG.neu"
+  echo "Alarme gehen an $NTFY_URL"
+fi
+
 ZIEL="$(sed -n 's/^host *= *//p' "$KONFIG" | head -1)"
 if python3 -c "import requests, sys; requests.get(f'http://{sys.argv[1]}/rpc/Shelly.GetDeviceInfo', timeout=5)" "$ZIEL" 2>/dev/null; then
   echo "Shelly unter $ZIEL erreichbar"
@@ -42,6 +61,11 @@ systemctl enable shelly-monitor >/dev/null
 systemctl restart shelly-monitor
 sleep 2
 systemctl --no-pager --lines=5 status shelly-monitor || true
+
+if [ -n "$NTFY_URL" ]; then
+  python3 /opt/shelly-monitor/shelly_monitor.py --config "$KONFIG" --alarm-test \
+    || echo "WARNUNG: Testalarm an $NTFY_URL nicht zugestellt – Internetzugang des Containers prüfen"
+fi
 
 # Beim Aufruf aus proxmox-lxc.sh zeigt das Host-Skript die Adresse selbst an
 if [ -z "${OHNE_ADRESSE:-}" ]; then

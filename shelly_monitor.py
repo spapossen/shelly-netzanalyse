@@ -1998,7 +1998,10 @@ def main():
         if not melder.aktiv:
             raise SystemExit(f"In {args.config} ist unter [alarm] weder ntfy_url noch smtp_host/mail_an eingetragen")
         fehler = melder.senden("warnung", "Testalarm", "Testmeldung der Netzüberwachung – Empfang funktioniert.")
-        raise SystemExit(f"Fehlgeschlagen: {fehler}" if fehler else "Testmeldung gesendet")
+        if fehler:
+            raise SystemExit(f"Testmeldung fehlgeschlagen: {fehler}")
+        print("Testmeldung gesendet")
+        return
     if not k.host and not args.nur_web:
         raise SystemExit(f"In {args.config} fehlt [shelly] host")
     verbinden(k.datenbank).close()

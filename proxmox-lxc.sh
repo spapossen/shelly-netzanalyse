@@ -11,7 +11,7 @@
 #
 # Alle Fragen lassen sich über Umgebungsvariablen vorbelegen, z. B. für eine Installation ohne Rückfragen:
 #   SHELLY_IP=192.168.1.50 SICHERUNG=35 CTID=120 NETZ=dhcp bash proxmox-lxc.sh
-# Variablen: SHELLY_IP SICHERUNG CTID CT_NAME STORAGE TEMPLATE_STORAGE DISK_GB RAM_MB CORES BRIDGE NETZ GATEWAY VLAN
+# Variablen: SHELLY_IP SICHERUNG NTFY_URL CTID CT_NAME STORAGE TEMPLATE_STORAGE DISK_GB RAM_MB CORES BRIDGE NETZ GATEWAY VLAN
 set -euo pipefail
 
 REPO="${REPO:-spapossen/shelly-netzanalyse}"
@@ -81,12 +81,39 @@ im_ct() {
   pct exec "$ctid" -- env LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE= "$@"
 }
 
+# Fragt nach dem ntfy-Thema für Alarme, solange in der Konfiguration des Containers keins eingetragen ist.
+# Ergebnis in NTFY_URL (leer = unverändert lassen).
+ntfy_fragen() {
+  local ctid="$1" vorhanden="" vorschlag
+  if [ -n "$ctid" ]; then
+    vorhanden="$(im_ct "$ctid" sed -n '/^\[alarm\]/,/^\[/s/^ntfy_url *= *//p' /etc/shelly-monitor/config.ini 2>/dev/null | head -1 || true)"
+  fi
+  if [ -n "${NTFY_URL:-}" ]; then
+    return
+  fi
+  if [ -n "$vorhanden" ]; then
+    info "Alarme gehen an $vorhanden (ändern: NTFY_URL=… oder in der config.ini)"
+    return
+  fi
+  # Ohne Terminal (Installation über Umgebungsvariablen) nichts erfinden
+  [ -r /dev/tty ] || return 0
+  vorschlag="netz-$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"
+  echo
+  echo "Alarm aufs Handy: App ntfy installieren und dort mit + ein Thema abonnieren."
+  echo "Thema oder eigene ntfy-URL eingeben, Enter übernimmt den Vorschlag, nein = ohne Alarm."
+  frage NTFY_URL "ntfy-Thema" "$vorschlag"
+  case "$NTFY_URL" in
+    nein|n|-) NTFY_URL="" ;;
+    *) info "In der ntfy-App das Thema ${NTFY_URL#https://ntfy.sh/} abonnieren – gleich kommt ein Testalarm." ;;
+  esac
+}
+
 dateien_installieren() {
   local ctid="$1"
   shift
   pct push "$ctid" "$ARBEIT/shelly-monitor.tar.gz" /root/shelly-monitor.tar.gz
   im_ct "$ctid" bash -c 'rm -rf /root/shelly-monitor && tar xzf /root/shelly-monitor.tar.gz -C /root && rm /root/shelly-monitor.tar.gz'
-  im_ct "$ctid" OHNE_ADRESSE=1 bash /root/shelly-monitor/install.sh "$@"
+  im_ct "$ctid" OHNE_ADRESSE=1 NTFY_URL="${NTFY_URL:-}" bash /root/shelly-monitor/install.sh "$@"
 }
 
 adresse_anzeigen() {
@@ -104,6 +131,7 @@ adresse_anzeigen() {
 if [ -n "$UPDATE_CTID" ]; then
   pct status "$UPDATE_CTID" >/dev/null 2>&1 || fehler "Container $UPDATE_CTID existiert nicht."
   pct status "$UPDATE_CTID" | grep -q running || pct start "$UPDATE_CTID"
+  ntfy_fragen "$UPDATE_CTID"
   paket_bauen
   dateien_installieren "$UPDATE_CTID"
   adresse_anzeigen "$UPDATE_CTID"
@@ -117,6 +145,7 @@ echo
 frage SHELLY_IP "IP-Adresse des Shelly Pro 3EM"
 [ -n "$SHELLY_IP" ] || fehler "Ohne Shelly-IP geht es nicht."
 frage SICHERUNG "Nennstrom der Vorsicherung des Messpunkts in A" "63"
+ntfy_fragen ""
 frage CTID "Container-ID" "$(pvesh get /cluster/nextid)"
 pct status "$CTID" >/dev/null 2>&1 && fehler "Container $CTID existiert bereits (zum Aktualisieren: --update $CTID)."
 frage CT_NAME "Hostname" "shelly-monitor"

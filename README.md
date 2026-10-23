@@ -36,7 +36,7 @@ SHELLY_IP=192.168.1.50 SICHERUNG=35 CTID=120 NETZ=192.168.1.60/24 GATEWAY=192.16
   bash -c "$(curl -fsSL https://raw.githubusercontent.com/spapossen/shelly-netzanalyse/main/proxmox-lxc.sh)"
 ```
 
-Weitere Variablen: `CT_NAME`, `STORAGE`, `TEMPLATE_STORAGE`, `DISK_GB`, `RAM_MB`, `CORES`, `BRIDGE`, `VLAN`,
+Weitere Variablen: `NTFY_URL` (ntfy-Thema für Alarme), `CT_NAME`, `STORAGE`, `TEMPLATE_STORAGE`, `DISK_GB`, `RAM_MB`, `CORES`, `BRIDGE`, `VLAN`,
 `DEBIAN_VERSION` (12 oder 13).
 
 **Aktualisieren** (Daten und Konfiguration bleiben erhalten):
@@ -155,7 +155,11 @@ Steigt eine Warnung zu „kritisch“ auf, kommt eine neue Meldung. Solange ein 
 aller Phasen. Alle Alarme mit Beginn, Ende und Extremwert landen in der Tabelle `alarm`. Sie stehen unter
 `/alarme` und als JSON unter `api/alarme`. Aktive Alarme erscheinen als Banner über dem Bericht.
 
-So richtest du die Benachrichtigung ein:
+Bei der Installation und bei jedem `--update` fragt `proxmox-lxc.sh` nach einem ntfy-Thema, solange noch keins
+eingetragen ist. Es schlägt einen zufälligen Namen vor. Das Skript trägt das Thema ein und schickt gleich einen
+Testalarm. Mit `nein` geht es ohne Alarm weiter. Ohne Rückfrage geht es mit `NTFY_URL=netz-… bash proxmox-lxc.sh …`.
+
+Von Hand richtest du die Benachrichtigung so ein:
 
 1. **Aufs Handy über ntfy:**
    - App „ntfy“ installieren (Android oder iOS).
