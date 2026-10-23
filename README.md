@@ -124,7 +124,7 @@ Als HTML-Datei speicherbar, die Daten gibt es auch als JSON unter `api/fachdaten
 bleiben. Fehlen sie, schalte bei laufendem Dienst ein paar Mal eine große Last ein und aus, etwa einen
 Wasserkocher oder ein Heizgerät.
 
-Dieselben Daten gibt es als JSON unter `api/bericht`, `api/fachdaten`, `api/verlauf`, `api/live` und `api/status`, mit den
+Dieselben Daten gibt es als JSON unter `api/bericht`, `api/fachdaten`, `api/verlauf`, `api/live`, `api/status` und `api/alarme`, mit den
 Parametern `von`/`bis` (z. B. `2026-10-18T08:00`) oder `zeitraum=1h|24h|7d|30d|alles`.
 
 ## Betrieb
@@ -133,11 +133,52 @@ Parametern `von`/`bis` (z. B. `2026-10-18T08:00`) oder `zeitraum=1h|24h|7d|30d|a
 pct exec 120 -- nano /etc/shelly-monitor/config.ini        # Sicherung, Name, Port, Web-Passwort, Aufbewahrung
 pct exec 120 -- systemctl restart shelly-monitor
 pct exec 120 -- journalctl -u shelly-monitor -f            # Log
-pct exec 120 -- sqlite3 /var/lib/shelly-monitor/daten.db   # Rohdaten: Tabellen minute, sekunde, stufe
+pct exec 120 -- sqlite3 /var/lib/shelly-monitor/daten.db   # Rohdaten: Tabellen minute, sekunde, stufe, alarm
 ```
 
 Die Weboberfläche ist ohne Anmeldung erreichbar. Wer sie schützen will, setzt in der Konfiguration unter
 `[web]` ein Passwort (HTTP Basic Auth). Sie gehört ins Heimnetz und nicht ungeschützt ins Internet.
+
+## Netzüberwachung und Alarm
+
+Der Dienst prüft jeden Sekundenwert gegen die Grenzen unter `[alarm]` und meldet Verletzungen:
+
+| Meldung | Warnung | kritisch |
+|---|---|---|
+| Spannung L–N | < 207 V oder > 253 V für 5 s | < 195 V oder > 265 V für 1 s, Ausfall < 100 V |
+| Sternpunktverschiebung (N unterbrochen oder hochohmig) | > 30 V für 5 s | > 50 V für 1 s |
+| Strom je Phase | > 90 % der Sicherung für 5 s | – |
+| Keine Messwerte vom Shelly | – | nach 30 s |
+
+Steigt eine Warnung zu „kritisch“ auf, kommt eine neue Meldung. Solange ein kritischer Alarm anhält, kommt alle
+30 min eine Erinnerung. Nach 2 min ohne Verletzung folgt die Entwarnung. Jede Meldung enthält die aktuellen Werte
+aller Phasen. Alle Alarme mit Beginn, Ende und Extremwert landen in der Tabelle `alarm`. Sie stehen unter
+`/alarme` und als JSON unter `api/alarme`. Aktive Alarme erscheinen als Banner über dem Bericht.
+
+So richtest du die Benachrichtigung ein:
+
+1. **Aufs Handy über ntfy:**
+   - App „ntfy“ installieren (Android oder iOS).
+   - Mit „+“ ein schwer zu erratendes Thema abonnieren, z. B. `netz-possen-7f3k9q`.
+   - In der Konfiguration `ntfy_url = https://ntfy.sh/netz-possen-7f3k9q` eintragen.
+   - Kritische Alarme haben die höchste Priorität. Damit die App sie auch im Nicht-stören-Modus durchlässt, in den Android-Einstellungen der App die Ausnahme erlauben.
+2. **Per E-Mail:** `smtp_host`, `smtp_benutzer`, `smtp_passwort` und `mail_an` eintragen.
+3. **Testen:**
+
+   ```bash
+   pct exec 120 -- systemctl restart shelly-monitor
+   pct exec 120 -- python3 /opt/shelly-monitor/shelly_monitor.py --config /etc/shelly-monitor/config.ini --alarm-test
+   ```
+
+Fällt der Messpunkt selbst spannungslos, meldet der Dienst „Keine Messwerte“. Das klappt nur, wenn der Server und
+der Internetzugang anders versorgt sind, z. B. über eine USV oder einen anderen Stromkreis. Für den Fall, dass
+der Server selbst ausfällt, gibt es `heartbeat_url`:
+
+- Den Eintrag zeigst du auf einen externen Wächter wie healthchecks.io.
+- Der Dienst ruft die Adresse jede Minute auf, solange frische Messwerte kommen.
+- Bleibt der Aufruf aus, alarmiert der Wächter von außen.
+
+Die Überwachung ersetzt keine Schutzeinrichtung. Sie meldet nur und schaltet nichts ab.
 
 ## Entwicklung
 

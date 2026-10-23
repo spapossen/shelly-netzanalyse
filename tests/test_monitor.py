@@ -238,6 +238,16 @@ class WebTest(Basis):
         _, kopf, text = self.holen(basis + "/export.csv?tabelle=sekunde&zeitraum=1h")
         self.assertTrue(text.startswith("zeit;ts;"))
         self.assertEqual(len(text.strip().splitlines()), 601)
+        sm.status_setzen(alarme_aktiv=[{"schluessel": "ueber_a", "stufe": "kritisch", "text": "Überspannung L1",
+                                        "seit": self.jetzt, "extrem": 270.0}])
+        self.addCleanup(sm.status_setzen, alarme_aktiv=[])
+        _, _, seite = self.holen(basis + "/?zeitraum=1h")
+        self.assertIn('class="alarm krit"', seite)
+        code, _, seite = self.holen(basis + "/alarme")
+        self.assertEqual(code, 200)
+        self.assertIn("Alarme", seite)
+        _, _, text = self.holen(basis + "/api/alarme")
+        self.assertEqual(json.loads(text)["aktiv"][0]["schluessel"], "ueber_a")
 
     def test_anmeldung(self):
         basis = self.server(web_benutzer="admin", web_passwort="geheim")
@@ -247,6 +257,107 @@ class WebTest(Basis):
         token = base64.b64encode(b"admin:geheim").decode()
         code, _, _ = self.holen(basis + "/api/status", {"Authorization": "Basic " + token})
         self.assertEqual(code, 200)
+
+
+class FakeMelder:
+    def __init__(self):
+        self.meldungen = []
+
+    def melden(self, stufe, titel, text):
+        self.meldungen.append((stufe, titel))
+
+
+class AlarmTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.k = sm.Konfig(None)
+        self.k.sicherung = 80.0
+        self.k.alarm_strom = 72.0
+        self.con = sm.verbinden(os.path.join(self.tmp.name, "daten.db"))
+        self.addCleanup(self.con.close)
+        self.melder = FakeMelder()
+        self.u = sm.Ueberwachung(self.k, self.melder, self.con)
+
+    @staticmethod
+    def zeile(ts, ua=230.0, ub=230.0, uc=230.0, i=5.0):
+        z = {"ts": ts, "a_voltage": ua, "b_voltage": ub, "c_voltage": uc,
+             "a_current": i, "b_current": i, "c_current": i}
+        z["calc_sternpunkt"] = sm.sternpunkt(ua, ub, uc)
+        return z
+
+    def test_bedingungen(self):
+        b = sm.alarm_bedingungen(self.zeile(0, ua=270, ub=205, uc=40, i=75), self.k)
+        self.assertEqual(b["ueber_a"][0], "kritisch")
+        self.assertEqual(b["unter_b"][0], "warnung")
+        self.assertEqual(b["ausfall_c"][0], "kritisch")
+        self.assertEqual(b["strom_a"][0], "warnung")
+        self.assertEqual(sm.alarm_bedingungen(self.zeile(0, ua=280, ub=230, uc=180), self.k)["stern"][0], "kritisch")
+        self.assertEqual(sm.alarm_bedingungen(self.zeile(0, ua=260, ub=230, uc=200), self.k)["stern"][0], "warnung")
+        self.assertEqual(sm.alarm_bedingungen(self.zeile(0), self.k), {})
+
+    def test_warnung_eskalation_entwarnung(self):
+        t = 1000
+        for _ in range(4):  # 4 s Unterspannung: noch keine Meldung
+            self.u.pruefen(t, self.zeile(t, ua=205), 0)
+            t += 1
+        self.assertEqual(self.melder.meldungen, [])
+        self.u.pruefen(t, self.zeile(t, ua=205), 0)
+        self.assertEqual(self.melder.meldungen[-1], ("warnung", "Unterspannung L1"))
+        t += 1
+        self.u.pruefen(t, self.zeile(t, ua=190), 0)
+        self.assertEqual(self.melder.meldungen[-1], ("kritisch", "Unterspannung L1"))
+        for _ in range(119):
+            t += 1
+            self.u.pruefen(t, self.zeile(t), 0)
+        self.assertEqual(len(self.melder.meldungen), 2)
+        t += 1
+        self.u.pruefen(t, self.zeile(t), 0)
+        self.assertEqual(self.melder.meldungen[-1][0], "entwarnung")
+        (start, ende, stufe, extrem), = self.con.execute("SELECT start, ende, stufe, extrem FROM alarm").fetchall()
+        self.assertEqual((start, stufe, extrem), (1000, "kritisch", 190))
+        self.assertIsNotNone(ende)
+
+    def test_kurze_spitze_wird_nicht_gemeldet(self):
+        self.u.pruefen(1, self.zeile(1, ub=255), 0)
+        self.u.pruefen(2, self.zeile(2), 0)
+        self.u.pruefen(3, self.zeile(3, ub=255), 0)
+        self.assertEqual(self.melder.meldungen, [])
+
+    def test_messausfall_und_erinnerung(self):
+        self.u.pruefen(100, self.zeile(60), 40)
+        self.assertEqual(self.melder.meldungen[-1][0], "kritisch")
+        self.assertIn("Keine Messwerte", self.melder.meldungen[-1][1])
+        self.u.pruefen(100 + 30 * 60, self.zeile(60), 40 + 30 * 60)
+        self.assertTrue(self.melder.meldungen[-1][1].startswith("weiterhin"))
+        self.u.pruefen(2000, self.zeile(2000), 0)
+        self.assertEqual(self.melder.meldungen[-1][0], "entwarnung")
+        self.assertEqual(self.u.aktiv, {})
+
+    def test_ntfy_versand(self):
+        empfangen = []
+
+        class Handler(sm.BaseHTTPRequestHandler):
+            def do_POST(self):
+                laenge = int(self.headers["Content-Length"])
+                empfangen.append((dict(self.headers), self.rfile.read(laenge).decode("utf-8")))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        server = sm.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.k.ntfy_url = "http://127.0.0.1:%d/netz" % server.server_address[1]
+        self.assertEqual(sm.Melder(self.k).senden("kritisch", "Überspannung L1", "U = 270 V"), {})
+        kopf, text = empfangen[0]
+        self.assertEqual(kopf["Priority"], "5")
+        self.assertEqual(text, "U = 270 V")
+        self.assertTrue(kopf["Title"].startswith("=?UTF-8?B?"))
+        self.assertIn("Überspannung L1", base64.b64decode(kopf["Title"][10:-2]).decode("utf-8"))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@ Läuft als Dienst (z. B. in einem Proxmox-LXC) und
   * holt beim Start und danach regelmäßig die 1-Minuten-Historie aus dem
     Speicher des Shelly (ca. 60 Tage, min/max/Ø von U und I je Phase, Energien),
   * fragt ab Start jede Sekunde alle Momentanwerte ab (U, I, P, S, cos phi, f),
-  * speichert alles in SQLite und
+  * speichert alles in SQLite,
+  * überwacht Spannung, Sternpunkt und Strom und meldet Grenzverletzungen über ntfy/E-Mail und
   * liefert über einen Webserver jederzeit einen Bericht für einen frei
     wählbaren Zeitraum (auch als HTML-Datei und CSV zum Herunterladen).
 
@@ -121,6 +122,27 @@ class Konfig:
         self.netzform = g("anlage", "netzform", "").upper()
         self.zuleitung = abschnitte_lesen(cp)
         self.zeitzone = ZoneInfo(g("anlage", "zeitzone", "Europe/Berlin"))
+        # Überwachung: Grenzen je Sekundenwert, Benachrichtigung über ntfy und/oder E-Mail
+        a = lambda schluessel, standard: float(g("alarm", schluessel, standard) or standard)
+        self.alarm_aktiv = g("alarm", "aktiv", "ja").lower() in ("ja", "1", "true", "an", "yes")
+        self.alarm_u_min, self.alarm_u_max = a("u_min", "207"), a("u_max", "253")
+        self.alarm_u_krit_min, self.alarm_u_krit_max = a("u_krit_min", "195"), a("u_krit_max", "265")
+        self.alarm_u_ausfall = a("u_ausfall", "100")
+        self.alarm_stern, self.alarm_stern_krit = a("sternpunkt_v", "30"), a("sternpunkt_krit_v", "50")
+        self.alarm_strom = a("strom_a", "0") or 0.9 * self.sicherung
+        self.alarm_dauer, self.alarm_dauer_krit = a("dauer_s", "5"), a("dauer_krit_s", "1")
+        self.alarm_keine_daten = a("keine_daten_s", "30")
+        self.alarm_entwarnung = a("entwarnung_s", "120")
+        self.alarm_wiederholung = a("wiederholung_min", "30")
+        self.ntfy_url = g("alarm", "ntfy_url", "")
+        self.ntfy_token = g("alarm", "ntfy_token", "")
+        self.smtp_host = g("alarm", "smtp_host", "")
+        self.smtp_port = int(a("smtp_port", "587"))
+        self.smtp_benutzer = g("alarm", "smtp_benutzer", "")
+        self.smtp_passwort = g("alarm", "smtp_passwort", "")
+        self.mail_von = g("alarm", "mail_von", "") or self.smtp_benutzer
+        self.mail_an = [m.strip() for m in g("alarm", "mail_an", "").split(",") if m.strip()]
+        self.heartbeat_url = g("alarm", "heartbeat_url", "")
 
 
 # --------------------------------------------------------------------------- Datenbank
@@ -135,6 +157,9 @@ def verbinden(pfad):
     # Laststufen zwischen zwei Sekundenwerten, Grundlage der Impedanzschätzung
     con.execute("CREATE TABLE IF NOT EXISTS stufe (ts INTEGER, phase TEXT, du REAL, di REAL, ruhe REAL, "
                 "PRIMARY KEY (ts, phase))")
+    # Alarme der Überwachung: Beginn, Ende (NULL = noch aktiv), höchste Stufe und Extremwert
+    con.execute("CREATE TABLE IF NOT EXISTS alarm (id INTEGER PRIMARY KEY, start INTEGER, ende INTEGER, "
+                "schluessel TEXT, stufe TEXT, text TEXT, extrem REAL)")
     return con
 
 
@@ -321,6 +346,257 @@ def abgleich(k, stop):
             if geloescht:
                 LOG.info("%d alte Sekundenwerte gelöscht", geloescht)
         stop.wait(k.abgleich_minuten * 60)
+
+
+# --------------------------------------------------------------------------- Überwachung und Alarm
+
+STUFE_RANG = {"warnung": 1, "kritisch": 2}
+
+
+def alarm_bedingungen(zeile, k):
+    """Grenzverletzungen eines Sekundenwerts: {schlüssel: (stufe, text, wert)}."""
+    verletzt = {}
+    for p, name in PHASEN:
+        u, i = zeile.get(f"{p}_voltage"), zeile.get(f"{p}_current")
+        if u is not None:
+            if u < k.alarm_u_ausfall:
+                verletzt[f"ausfall_{p}"] = ("kritisch", f"Spannungsausfall {name}", u)
+            elif u < k.alarm_u_krit_min:
+                verletzt[f"unter_{p}"] = ("kritisch", f"Unterspannung {name}", u)
+            elif u < k.alarm_u_min:
+                verletzt[f"unter_{p}"] = ("warnung", f"Unterspannung {name}", u)
+            if u > k.alarm_u_krit_max:
+                verletzt[f"ueber_{p}"] = ("kritisch", f"Überspannung {name}", u)
+            elif u > k.alarm_u_max:
+                verletzt[f"ueber_{p}"] = ("warnung", f"Überspannung {name}", u)
+        if i is not None and k.alarm_strom and i > k.alarm_strom:
+            verletzt[f"strom_{p}"] = ("warnung", f"Hoher Strom {name}", i)
+    s = zeile.get("calc_sternpunkt")
+    if s is not None and s > k.alarm_stern:
+        verletzt["stern"] = ("kritisch" if s > k.alarm_stern_krit else "warnung", "Sternpunktverschiebung", s)
+    return verletzt
+
+
+def live_text(zeile, k):
+    if not zeile:
+        return "keine Messwerte"
+    teile = []
+    for p, name in PHASEN:
+        u, i = zeile.get(f"{p}_voltage"), zeile.get(f"{p}_current")
+        teile.append(f"{name} {z(u, 1, 'V')} / {z(i, 1, 'A')}")
+    if zeile.get("calc_sternpunkt") is not None:
+        teile.append(f"Sternpunkt {z(zeile['calc_sternpunkt'], 1, 'V')}")
+    if zeile.get("calc_n_current") is not None:
+        teile.append(f"N ≈ {z(zeile['calc_n_current'], 1, 'A')}")
+    return f"{zeit(zeile.get('ts'), k, '%d.%m. %H:%M:%S')}: " + ", ".join(teile)
+
+
+class Melder:
+    """Verschickt Meldungen über ntfy und/oder E-Mail in einem eigenen Thread, damit ein hängender
+    Versand die Überwachung nicht aufhält."""
+
+    PRIORITAET = {"kritisch": "5", "warnung": "4", "entwarnung": "3", "info": "2"}
+    TAGS = {"kritisch": "rotating_light", "warnung": "warning", "entwarnung": "white_check_mark", "info": "information_source"}
+
+    def __init__(self, k):
+        self.k = k
+        self.schlange = []
+        self.bedingung = threading.Condition()
+
+    @property
+    def aktiv(self):
+        return bool(self.k.ntfy_url or (self.k.smtp_host and self.k.mail_an))
+
+    def melden(self, stufe, titel, text):
+        LOG.log(logging.WARNING if stufe in ("kritisch", "warnung") else logging.INFO, "ALARM %s: %s – %s",
+                stufe, titel, text)
+        status_setzen(letzte_meldung=f"{datetime.now(self.k.zeitzone):%d.%m. %H:%M:%S} {stufe}: {titel}")
+        with self.bedingung:
+            self.schlange.append((stufe, titel, text))
+            self.bedingung.notify()
+
+    def senden(self, stufe, titel, text):
+        """Sendet sofort über alle eingerichteten Kanäle; liefert die Fehler je Kanal."""
+        fehler = {}
+        titel = f"{self.k.name}: {titel}"
+        if self.k.ntfy_url:
+            try:
+                kopf = {"Title": "=?UTF-8?B?" + base64.b64encode(titel.encode()).decode() + "?=",
+                        "Priority": self.PRIORITAET.get(stufe, "3"), "Tags": self.TAGS.get(stufe, "")}
+                if self.k.ntfy_token:
+                    kopf["Authorization"] = f"Bearer {self.k.ntfy_token}"
+                requests.post(self.k.ntfy_url, data=text.encode("utf-8"), headers=kopf, timeout=15).raise_for_status()
+            except Exception as e:
+                fehler["ntfy"] = str(e)
+        if self.k.smtp_host and self.k.mail_an:
+            try:
+                import smtplib
+                from email.message import EmailMessage
+                m = EmailMessage()
+                m["Subject"] = f"[{stufe.upper()}] {titel}"
+                m["From"] = self.k.mail_von
+                m["To"] = ", ".join(self.k.mail_an)
+                m.set_content(text)
+                with smtplib.SMTP(self.k.smtp_host, self.k.smtp_port, timeout=20) as s:
+                    if self.k.smtp_port != 25:
+                        s.starttls()
+                    if self.k.smtp_benutzer:
+                        s.login(self.k.smtp_benutzer, self.k.smtp_passwort)
+                    s.send_message(m)
+            except Exception as e:
+                fehler["mail"] = str(e)
+        for kanal, f in fehler.items():
+            LOG.warning("Meldung über %s fehlgeschlagen: %s", kanal, f)
+        return fehler
+
+    def arbeiten(self, stop):
+        while not stop.is_set():
+            with self.bedingung:
+                while not self.schlange and not stop.is_set():
+                    self.bedingung.wait(5)
+                if not self.schlange:
+                    continue
+                stufe, titel, text = self.schlange.pop(0)
+            # Ein Fehlversuch (z. B. Internet kurz weg) wird nach 30 s noch einmal versucht
+            if self.senden(stufe, titel, text) and not stop.wait(30):
+                self.senden(stufe, titel, text)
+
+
+class Ueberwachung:
+    """Zustandsautomat je Grenzverletzung: melden nach Mindestdauer, Eskalation, Erinnerung, Entwarnung."""
+
+    def __init__(self, k, melder, con):
+        self.k, self.melder, self.con = k, melder, con
+        self.seit = {}      # schlüssel -> Beginn der laufenden Verletzung (noch nicht gemeldet)
+        self.aktiv = {}     # schlüssel -> dict(id, stufe, text, extrem, gemeldet, zuletzt_verletzt)
+
+    def _extrem(self, schluessel, alt, neu):
+        if alt is None:
+            return neu
+        return min(alt, neu) if schluessel.startswith(("unter_", "ausfall_")) else max(alt, neu)
+
+    def _text(self, text, wert, schluessel, zeile):
+        einheit = "A" if schluessel.startswith("strom_") else ("s" if schluessel == "messung" else "V")
+        return f"{text}: {z(wert, 1, einheit)}\n{live_text(zeile, self.k)}"
+
+    def pruefen(self, jetzt, zeile, alter):
+        if alter is None or alter > self.k.alarm_keine_daten:
+            verletzt = {"messung": ("kritisch", "Keine Messwerte vom Shelly (Spannungsausfall am Messpunkt, "
+                                                "Shelly oder Netzwerk gestört)", alter if alter is not None else -1)}
+            frisch = False
+        else:
+            verletzt = alarm_bedingungen(zeile or {}, self.k)
+            frisch = True
+        for s in list(self.seit):
+            if s not in verletzt:
+                del self.seit[s]
+        for s, (stufe, text, wert) in verletzt.items():
+            a = self.aktiv.get(s)
+            if a:
+                a["zuletzt"] = jetzt
+                a["extrem"] = self._extrem(s, a["extrem"], wert)
+                if STUFE_RANG[stufe] > STUFE_RANG[a["stufe"]]:
+                    a.update(stufe=stufe, text=text, gemeldet=jetzt)
+                    self.melder.melden(stufe, text, self._text(text, wert, s, zeile))
+                elif a["stufe"] == "kritisch" and jetzt - a["gemeldet"] >= self.k.alarm_wiederholung * 60:
+                    a["gemeldet"] = jetzt
+                    self.melder.melden(stufe, f"weiterhin: {text}", self._text(text, wert, s, zeile)
+                                       + f"\nseit {zeit(a['start'], self.k, '%d.%m. %H:%M:%S')}")
+                self.con.execute("UPDATE alarm SET stufe = ?, text = ?, extrem = ? WHERE id = ?",
+                                 (a["stufe"], a["text"], a["extrem"], a["id"]))
+                continue
+            beginn = self.seit.setdefault(s, jetzt)
+            mindest = self.k.alarm_dauer_krit if stufe == "kritisch" else self.k.alarm_dauer
+            if s == "messung":
+                mindest = 0
+            if jetzt - beginn + 1 >= mindest:
+                del self.seit[s]
+                aid = self.con.execute("INSERT INTO alarm (start, schluessel, stufe, text, extrem) VALUES (?, ?, ?, ?, ?)",
+                                       (beginn, s, stufe, text, wert)).lastrowid
+                self.aktiv[s] = {"id": aid, "start": beginn, "stufe": stufe, "text": text, "extrem": wert,
+                                 "gemeldet": jetzt, "zuletzt": jetzt}
+                self.melder.melden(stufe, text, self._text(text, wert, s, zeile))
+        for s in list(self.aktiv):
+            a = self.aktiv[s]
+            if s in verletzt:
+                continue
+            # Grenzwerte gelten erst nach entwarnung_s frischer, unauffälliger Daten als wieder eingehalten;
+            # der Messausfall endet mit dem ersten frischen Wert
+            if (s == "messung" and frisch) or (frisch and jetzt - a["zuletzt"] >= self.k.alarm_entwarnung):
+                self.con.execute("UPDATE alarm SET ende = ? WHERE id = ?", (jetzt, a["id"]))
+                del self.aktiv[s]
+                self.melder.melden("entwarnung", f"Entwarnung: {a['text']}",
+                                   f"{a['text']} von {zeit(a['start'], self.k, '%d.%m. %H:%M:%S')} bis "
+                                   f"{zeit(jetzt, self.k, '%H:%M:%S')}, Extremwert {z(a['extrem'], 1)}\n"
+                                   + live_text(zeile, self.k))
+        self.con.commit()
+        status_setzen(alarme_aktiv=[{"schluessel": s, "stufe": a["stufe"], "text": a["text"], "seit": a["start"],
+                                     "extrem": a["extrem"]} for s, a in sorted(self.aktiv.items())])
+
+
+def ueberwachung(k, stop, melder):
+    """Prüft jede Sekunde den letzten Messwert, meldet Grenzverletzungen und pingt die Heartbeat-URL."""
+    con = verbinden(k.datenbank)
+    # Beim Neustart offene Alarme schließen, sie werden bei Bedarf neu erkannt
+    con.execute("UPDATE alarm SET ende = ? WHERE ende IS NULL", (int(time.time()),))
+    con.commit()
+    u = Ueberwachung(k, melder, con)
+    melder.melden("info", "Überwachung gestartet",
+                  f"Grenzen: U {z(k.alarm_u_min, 0)}–{z(k.alarm_u_max, 0)} V (kritisch {z(k.alarm_u_krit_min, 0)}–"
+                  f"{z(k.alarm_u_krit_max, 0)} V), Sternpunkt {z(k.alarm_stern, 0)}/{z(k.alarm_stern_krit, 0)} V, "
+                  f"Strom {z(k.alarm_strom, 0)} A, Messausfall nach {z(k.alarm_keine_daten, 0)} s")
+    stop.wait(max(5, 3 * k.intervall))  # erste Messungen abwarten
+    letzter_ping = 0.0
+    while not stop.is_set():
+        jetzt = int(time.time())
+        with STATUS_LOCK:
+            zeile, letzte = STATUS["live"], STATUS["letzte_messung"]
+        alter = None if letzte is None else jetzt - letzte
+        try:
+            u.pruefen(jetzt, zeile, alter)
+        except Exception:
+            LOG.exception("Überwachung fehlgeschlagen")
+        if k.heartbeat_url and alter is not None and alter <= k.alarm_keine_daten and time.time() - letzter_ping >= 60:
+            letzter_ping = time.time()
+            try:
+                requests.get(k.heartbeat_url, timeout=10)
+            except Exception as e:
+                LOG.warning("Heartbeat fehlgeschlagen: %s", e)
+        stop.wait(1)
+    con.close()
+
+
+def alarme(con, grenze=200):
+    zeilen = con.execute("SELECT start, ende, schluessel, stufe, text, extrem FROM alarm ORDER BY start DESC LIMIT ?",
+                         (grenze,)).fetchall()
+    return [dict(zip(("start", "ende", "schluessel", "stufe", "text", "extrem"), r)) for r in zeilen]
+
+
+def alarm_banner(st, k):
+    aktiv = st.get("alarme_aktiv") or []
+    if not aktiv:
+        return ""
+    stufe = "krit" if any(a["stufe"] == "kritisch" for a in aktiv) else "warn"
+    punkte = "".join(f"<li>{html.escape(a['text'])} seit {zeit(a['seit'], k, '%d.%m. %H:%M:%S')}"
+                     f" (Extremwert {z(a['extrem'], 1)})</li>" for a in aktiv)
+    return (f'<div class="alarm {stufe}"><b>Aktiver Alarm</b><ul>{punkte}</ul>'
+            f'<a href="alarme">Alle Alarme</a></div>')
+
+
+def alarme_html(liste, k):
+    zeilen = []
+    for a in liste:
+        stufe = {"kritisch": "krit", "warnung": "warn"}.get(a["stufe"], "info")
+        zeilen.append(f"<tr><td>{zeit(a['start'], k, '%d.%m.%Y %H:%M:%S')}</td>"
+                      f"<td>{zeit(a['ende'], k, '%d.%m.%Y %H:%M:%S') if a['ende'] else '<b>aktiv</b>'}</td>"
+                      f"<td>{ampel(stufe, a['stufe'])}</td><td>{html.escape(a['text'] or '')}</td>"
+                      f"<td>{z(a['extrem'], 1)}</td></tr>")
+    tabelle = ("<div class='scroll'><table><thead><tr><th>Beginn</th><th>Ende</th><th>Stufe</th><th>Meldung</th>"
+               "<th>Extremwert</th></tr></thead><tbody>" + "".join(zeilen) + "</tbody></table></div>"
+               if zeilen else "<p class='mut'>Bisher keine Alarme.</p>")
+    return [f"<section class='karte'><h2>Alarme (neueste zuerst, höchstens 200)</h2>{tabelle}"
+            "<p class='hinweis'>Extremwert: kleinste bzw. größte Spannung in V, Strom in A, "
+            "Messausfall in s.</p></section>"]
 
 
 # --------------------------------------------------------------------------- Neutralleiter und Sternpunkt
@@ -1327,6 +1603,7 @@ def seite_bauen(t, r, v, k, eingabe, download, modus):
                         + (f" – {st['letzter_fehler']}" if st["letzter_fehler"] else "")),
         "__QUERY__": e(eingabe_query(eingabe, modus)),
         "__STEUERUNG__": "" if not download else "versteckt",
+        "__ALARM__": "" if download else alarm_banner(st, k),
         "__INHALT__": "\n".join(t),
         "__DATEN__": daten.replace("</", "<\\/"),
     }
@@ -1389,8 +1666,10 @@ table.klein{font-size:12.5px}table.klein th,table.klein td{padding:5px 8px 5px 0
 .messpunkt:empty{display:none}.messpunkt{margin:2px 0 4px!important;color:var(--text)!important}
 ul.methoden{margin:0;padding-left:18px}ul.methoden li{margin:4px 0}
 @media (max-width:600px){dl.liste{grid-template-columns:1fr}dl.liste dd{margin-bottom:6px}}
+.alarm{border:2px solid currentColor;border-radius:10px;padding:10px 14px;margin-bottom:14px;background:var(--surface)}
+.alarm.krit{color:var(--krit)}.alarm.warn{color:var(--warn)}.alarm ul{margin:4px 0;padding-left:18px;color:var(--text)}
 </style></head><body><main>
-<header><h1>__ART__ __TITEL__</h1><p class="messpunkt">__MESSPUNKT__</p><p>__ZEITRAUM__ · Sicherung __SICHERUNG__ · erstellt __ERSTELLT__</p>
+__ALARM__<header><h1>__ART__ __TITEL__</h1><p class="messpunkt">__MESSPUNKT__</p><p>__ZEITRAUM__ · Sicherung __SICHERUNG__ · erstellt __ERSTELLT__</p>
 <p class="hinweis __STEUERUNG__">__STATUS__</p></header>
 <form class="steuerung __STEUERUNG__" method="get" action="./">
 <label>Von<input type="datetime-local" name="von" value="__VON__"></label>
@@ -1626,6 +1905,15 @@ def webserver(k):
                     with STATUS_LOCK:
                         live = STATUS["live"]
                     return self.senden(200, "application/json", json.dumps(live))
+                if pfad == "/api/alarme":
+                    con = verbinden(k.datenbank)
+                    try:
+                        with STATUS_LOCK:
+                            aktiv = STATUS.get("alarme_aktiv") or []
+                        return self.senden(200, "application/json",
+                                           json.dumps({"aktiv": aktiv, "verlauf": alarme(con)}))
+                    finally:
+                        con.close()
                 if pfad == "/api/status":
                     with STATUS_LOCK:
                         return self.senden(200, "application/json", json.dumps(STATUS, default=str))
@@ -1645,6 +1933,10 @@ def webserver(k):
                         return self.senden(200, "application/json", json.dumps(verlauf(con, von, bis, kk)))
                     if pfad == "/export.csv":
                         return self.export(con, von, bis, kk, (params.get("tabelle") or ["minute"])[0])
+                    if pfad == "/alarme":
+                        r = {"von": von, "bis": bis, "neutral": None}
+                        seite = seite_bauen(alarme_html(alarme(con), kk), r, [], kk, eingabe, False, "uebersicht")
+                        return self.senden(200, "text/html; charset=utf-8", seite)
                     if pfad == "/":
                         download = bool(params.get("download"))
                         fach = (params.get("modus") or [""])[0] == "fach"
@@ -1697,9 +1989,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="/etc/shelly-monitor/config.ini")
     ap.add_argument("--nur-web", action="store_true", help="nur Webserver, keine Erfassung (z. B. zum Testen)")
+    ap.add_argument("--alarm-test", action="store_true", help="Testmeldung über alle Alarmkanäle senden und beenden")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     k = Konfig(args.config)
+    melder = Melder(k)
+    if args.alarm_test:
+        if not melder.aktiv:
+            raise SystemExit(f"In {args.config} ist unter [alarm] weder ntfy_url noch smtp_host/mail_an eingetragen")
+        fehler = melder.senden("warnung", "Testalarm", "Testmeldung der Netzüberwachung – Empfang funktioniert.")
+        raise SystemExit(f"Fehlgeschlagen: {fehler}" if fehler else "Testmeldung gesendet")
     if not k.host and not args.nur_web:
         raise SystemExit(f"In {args.config} fehlt [shelly] host")
     verbinden(k.datenbank).close()
@@ -1707,6 +2006,11 @@ def main():
     if not args.nur_web:
         threading.Thread(target=erfassung, args=(k, stop), name="erfassung", daemon=True).start()
         threading.Thread(target=abgleich, args=(k, stop), name="abgleich", daemon=True).start()
+        if k.alarm_aktiv:
+            if not melder.aktiv:
+                LOG.warning("Überwachung ohne Benachrichtigung: [alarm] ntfy_url oder smtp_host/mail_an fehlt")
+            threading.Thread(target=melder.arbeiten, args=(stop,), name="melder", daemon=True).start()
+            threading.Thread(target=ueberwachung, args=(k, stop, melder), name="ueberwachung", daemon=True).start()
     server = webserver(k)
 
     def beenden(*_):
